@@ -1,0 +1,40 @@
+{
+  "database": {
+    "path": "var/goclaw.db"
+  },
+  "channels": {
+    "feishu": {
+      "enabled": true,
+      "defaultAccount": "main",
+      "connectionMode": "longpoll",
+      "renderMode": "auto",
+      "actions": {
+        "processingAck": true,
+        "messageSend": true,
+        "messageUpdate": true,
+        "messageRecall": true,
+        "reactions": true,
+        "pins": true,
+        "postMessages": true,
+        "docsRead": true
+      },
+      "processingAckEmoji": "EYES",
+      "accounts": {
+        "main": {
+          "profileId": "main",
+          "renderMode": "card",
+          "processingAckEmoji": "DONE",
+          "actions": {
+            "processingAck": false
+          }
+        }
+      }
+    }
+  },
+  "model": {
+    "provider": "openai-compatible",
+    "api": "openai-completions",
+    "baseUrl": "https://api.openai.com/v1",
+    "modelId": "gpt-4.1-mini"
+  }
+}

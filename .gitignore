@@ -1,0 +1,11 @@
+.DS_Store
+
+.idea/
+.tmp/
+GoClaw/
+var/
+
+PLAN.md
+PARALLEL_PLAN.md
+THREAD_PROMPTS.md
+上下文.txt
