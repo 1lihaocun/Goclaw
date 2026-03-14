@@ -12,20 +12,40 @@ import (
 	toolruntime "goclaw/internal/tools"
 )
 
+type replyModelPlan struct {
+	Request  model.Request
+	Policy   domain.ToolPermissionPolicy
+	Mode     toolingMode
+	Session  agenttools.SessionContext
+	Registry *agenttools.Registry
+}
+
 func (s *ReplyService) generateReplyText(
 	ctx context.Context,
 	roomContext RoomContext,
 	promptPackage PromptPackage,
 ) (string, error) {
+	snapshot, err := s.buildRunSnapshot(ctx, roomContext, promptPackage)
+	if err != nil {
+		return "", err
+	}
+	return s.generateReplyTextFromSnapshot(ctx, snapshot)
+}
+
+func (s *ReplyService) buildReplyModelPlan(
+	ctx context.Context,
+	roomContext RoomContext,
+	promptPackage PromptPackage,
+) (replyModelPlan, error) {
 	request := toModelRequest(promptPackage)
 	policy, enabled, err := s.resolveToolLoopPolicy(ctx, roomContext)
 	if err != nil {
-		return "", err
+		return replyModelPlan{}, err
 	}
 	session := agentToolSessionContext(roomContext)
 	visibleTools, toolDefinitions, err := s.visibleAgentTools(session, policy)
 	if err != nil {
-		return "", err
+		return replyModelPlan{}, err
 	}
 	mode := s.resolveToolingMode(enabled && len(visibleTools) > 0)
 	registry := s.toolRegistry()
@@ -48,8 +68,57 @@ func (s *ReplyService) generateReplyText(
 		request.System,
 		buildCapabilitySnapshot(roomContext, promptPackage, toolDefinitions, channelSummary, s.PromptBuilder, policy, mode),
 	)
+	return replyModelPlan{
+		Request:  request,
+		Policy:   policy,
+		Mode:     mode,
+		Session:  session,
+		Registry: registry,
+	}, nil
+}
+
+func (s *ReplyService) generateReplyTextFromPlan(
+	ctx context.Context,
+	roomContext RoomContext,
+	plan replyModelPlan,
+) (string, error) {
+	return s.generateReplyTextFromSnapshot(ctx, freezeRunSnapshot(
+		buildReplyRunID(roomContext.Profile.ID, roomContext.Room.ID, roomContext.TriggerMessageID, s.Now),
+		runEventNow(s.Now),
+		roomContext,
+		PromptPackage{},
+		plan,
+	))
+}
+
+func (s *ReplyService) generateReplyTextFromSnapshot(
+	ctx context.Context,
+	snapshot RunSnapshot,
+) (string, error) {
+	return s.generateReplyTextFromSnapshotWithObservers(ctx, snapshot, nil)
+}
+
+func (s *ReplyService) generateReplyTextFromSnapshotWithObservers(
+	ctx context.Context,
+	snapshot RunSnapshot,
+	required []RunObserver,
+) (string, error) {
+	plan := snapshot.ReplyPlan
+	runEvents := newRunEventEmitterForSnapshot(s.Logger, snapshot, s.Now, required, s.RunObservers)
+	request := plan.Request
+	policy := snapshot.ToolPolicy
+	mode := snapshot.ToolingMode
+	session := plan.Session
+	registry := plan.Registry
 	if mode == toolingModeDisabled || registry == nil {
-		return s.Model.Generate(ctx, request)
+		if err := runEvents.EmitRunStarted(ctx); err != nil {
+			return "", err
+		}
+		finalText, err := s.Model.Generate(ctx, request)
+		if finishErr := runEvents.EmitRunFinished(ctx, finalText, err); finishErr != nil && err == nil {
+			return "", finishErr
+		}
+		return finalText, err
 	}
 	orchestrator := toolruntime.Orchestrator{
 		Registry: registry,
@@ -71,15 +140,67 @@ func (s *ReplyService) generateReplyText(
 			}
 			s.Logger.Info(
 				message,
-				"profile_id", roomContext.Profile.ID,
-				"room_id", roomContext.Room.ID,
+				"profile_id", snapshot.Profile.ID,
+				"room_id", snapshot.Room.ID,
 				"tool", call.Name,
 				"iteration", iteration,
 			)
 		},
 	}
-	orchestrator.OnRunStart, orchestrator.OnRunFinish, orchestrator.OnInvocationStart, orchestrator.OnInvocationFinish =
-		s.toolingAuditHooks(roomContext, policy, mode)
+	auditRunStart, auditRunFinish, auditInvocationStart, auditInvocationFinish :=
+		s.toolingAuditHooks(snapshot.RoomContext(), policy, mode)
+	orchestrator.OnRunStart = func(runCtx context.Context) error {
+		if err := runEvents.EmitRunStarted(runCtx); err != nil {
+			return err
+		}
+		if auditRunStart != nil {
+			return auditRunStart(runCtx)
+		}
+		return nil
+	}
+	orchestrator.OnRunFinish = func(runCtx context.Context, finalText string, runErr error) error {
+		if auditRunFinish != nil {
+			if err := auditRunFinish(runCtx, finalText, runErr); err != nil && runErr == nil {
+				runErr = err
+			}
+		}
+		return runEvents.EmitRunFinished(runCtx, finalText, runErr)
+	}
+	orchestrator.OnInvocationStart = func(
+		runCtx context.Context,
+		iteration int,
+		call toolruntime.ToolCallBlock,
+		native bool,
+	) (string, error) {
+		if err := runEvents.OnToolCallStarted(
+			runCtx,
+			iteration,
+			call.ID,
+			call.Name,
+			string(call.Args),
+			toolruntime.ToolCallSummary(call),
+			native,
+		); err != nil {
+			return "", err
+		}
+		if auditInvocationStart != nil {
+			return auditInvocationStart(runCtx, iteration, call, native)
+		}
+		return "", nil
+	}
+	orchestrator.OnInvocationFinish = func(
+		runCtx context.Context,
+		invocationID string,
+		content string,
+		invocationErr error,
+	) error {
+		if auditInvocationFinish != nil {
+			if err := auditInvocationFinish(runCtx, invocationID, content, invocationErr); err != nil && invocationErr == nil {
+				invocationErr = err
+			}
+		}
+		return runEvents.OnToolCallFinished(runCtx, content, invocationErr)
+	}
 	return orchestrator.Run(ctx, s.Model, request)
 }
 
@@ -124,10 +245,22 @@ func toolLoopEnabled(policy domain.ToolPermissionPolicy) bool {
 		policy.ChannelSensitiveMode != domain.ToolPermissionDenyAll {
 		return true
 	}
+	if policy.MCPIntrospectionMode != domain.ToolPermissionDenyAll ||
+		policy.MCPReadMode != domain.ToolPermissionDenyAll ||
+		policy.MCPWriteMode != domain.ToolPermissionDenyAll ||
+		policy.MCPSensitiveMode != domain.ToolPermissionDenyAll {
+		return true
+	}
 	if len(policy.AllowedChannelProviders) > 0 ||
 		len(policy.DeniedChannelProviders) > 0 ||
 		len(policy.AllowedChannelTools) > 0 ||
 		len(policy.DeniedChannelTools) > 0 {
+		return true
+	}
+	if len(policy.AllowedMCPServers) > 0 ||
+		len(policy.DeniedMCPServers) > 0 ||
+		len(policy.AllowedMCPTools) > 0 ||
+		len(policy.DeniedMCPTools) > 0 {
 		return true
 	}
 	if policy.CommandsMode != domain.ToolPermissionDenyAll {
@@ -224,6 +357,10 @@ func renderToolPolicy(policy domain.ToolPermissionPolicy) string {
 		fmt.Sprintf("channel_read_mode=%s", toolPermissionModeLabel(policy.ChannelReadMode)),
 		fmt.Sprintf("channel_write_mode=%s", toolPermissionModeLabel(policy.ChannelWriteMode)),
 		fmt.Sprintf("channel_sensitive_mode=%s", toolPermissionModeLabel(policy.ChannelSensitiveMode)),
+		fmt.Sprintf("mcp_introspection_mode=%s", toolPermissionModeLabel(policy.MCPIntrospectionMode)),
+		fmt.Sprintf("mcp_read_mode=%s", toolPermissionModeLabel(policy.MCPReadMode)),
+		fmt.Sprintf("mcp_write_mode=%s", toolPermissionModeLabel(policy.MCPWriteMode)),
+		fmt.Sprintf("mcp_sensitive_mode=%s", toolPermissionModeLabel(policy.MCPSensitiveMode)),
 	}
 	if len(policy.AllowedCommands) > 0 {
 		lines = append(lines, "allowed_commands="+strings.Join(policy.AllowedCommands, ","))
@@ -254,6 +391,18 @@ func renderToolPolicy(policy domain.ToolPermissionPolicy) string {
 	}
 	if len(policy.DeniedChannelProviders) > 0 {
 		lines = append(lines, "denied_channel_providers="+strings.Join(policy.DeniedChannelProviders, ","))
+	}
+	if len(policy.AllowedMCPTools) > 0 {
+		lines = append(lines, "allowed_mcp_tools="+strings.Join(policy.AllowedMCPTools, ","))
+	}
+	if len(policy.DeniedMCPTools) > 0 {
+		lines = append(lines, "denied_mcp_tools="+strings.Join(policy.DeniedMCPTools, ","))
+	}
+	if len(policy.AllowedMCPServers) > 0 {
+		lines = append(lines, "allowed_mcp_servers="+strings.Join(policy.AllowedMCPServers, ","))
+	}
+	if len(policy.DeniedMCPServers) > 0 {
+		lines = append(lines, "denied_mcp_servers="+strings.Join(policy.DeniedMCPServers, ","))
 	}
 	return strings.Join(lines, "\n")
 }

@@ -3,13 +3,16 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
+	"sync"
 	"time"
 
 	"goclaw/internal/agenttools"
 	channelcore "goclaw/internal/channels"
 	feishuchannel "goclaw/internal/channels/feishu"
 	"goclaw/internal/config"
+	"goclaw/internal/mcp"
 	"goclaw/internal/memory"
 	memorymemos "goclaw/internal/memory/memos"
 	"goclaw/internal/memory/noop"
@@ -18,6 +21,7 @@ import (
 	modelecho "goclaw/internal/model/echo"
 	modelnoop "goclaw/internal/model/noop"
 	modelopenaicompat "goclaw/internal/model/openaicompat"
+	skillsctx "goclaw/internal/skills"
 	sqlitestore "goclaw/internal/store/sqlite"
 	toolruntime "goclaw/internal/tools"
 	workspacectx "goclaw/internal/workspace"
@@ -33,6 +37,11 @@ type App struct {
 	Repos      sqlitestore.Repositories
 	Channels   *channelcore.Registry
 	channelErr error
+
+	mcpMu       sync.Mutex
+	mcpProvider agenttools.Provider
+	mcpCloser   io.Closer
+	mcpInit     bool
 }
 
 func New(cfg config.Config) *App {
@@ -79,6 +88,21 @@ func (a *App) Initialize(ctx context.Context) error {
 	return nil
 }
 
+func (a *App) Close() error {
+	var closeErr error
+	if a.mcpCloser != nil {
+		if err := a.mcpCloser.Close(); err != nil {
+			closeErr = err
+		}
+	}
+	if a.Store != nil {
+		if err := a.Store.Close(); err != nil && closeErr == nil {
+			closeErr = err
+		}
+	}
+	return closeErr
+}
+
 func (a *App) NewBuildRuntimeParams(logger *slog.Logger) channelcore.BuildRuntimeParams {
 	if logger == nil {
 		logger = slog.Default()
@@ -92,11 +116,12 @@ func (a *App) NewBuildRuntimeParams(logger *slog.Logger) channelcore.BuildRuntim
 
 	replyService := NewReplyService(
 		a.Repos,
-		NewPromptBuilder(a.Repos, a.Memory, workspacectx.NewLoader(a.Config.Workspace.Root)),
+		newPromptBuilder(a.Config, a.Repos, a.Memory),
 		a.Model,
 		a.Channels,
 	)
 	replyService.Logger = logger
+	replyService.FeishuStreamingToolSummaries = a.Config.Channels.Feishu.StreamingToolSummaries
 	replyService.LegacyToolFallbackEnabled = a.Config.Tooling.LegacyJSONFallbackEnabled
 	replyService.ToolMaxIterations = a.Config.Tooling.MaxIterations
 	replyService.Tools = localRuntime
@@ -119,6 +144,12 @@ func (a *App) newAgentToolRegistry(
 	providers := []agenttools.Provider{
 		toolruntime.NewLocalToolProvider(localRuntime),
 	}
+	mcpProvider, err := a.cachedMCPProvider(logger)
+	if err != nil {
+		logger.Warn("runtime: failed to initialize mcp provider", "error", err)
+	} else if mcpProvider != nil {
+		providers = append(providers, mcpProvider)
+	}
 	channelProviders, err := a.Channels.AgentToolProviders(channelcore.ToolBuildParams{
 		Logger: logger,
 		Repos:  a.Repos,
@@ -129,6 +160,42 @@ func (a *App) newAgentToolRegistry(
 	}
 	providers = append(providers, channelProviders...)
 	return agenttools.NewRegistry(providers...), nil
+}
+
+func (a *App) cachedMCPProvider(logger *slog.Logger) (agenttools.Provider, error) {
+	a.mcpMu.Lock()
+	defer a.mcpMu.Unlock()
+
+	if a.mcpInit {
+		return a.mcpProvider, nil
+	}
+	provider, err := mcp.NewProvider(context.Background(), a.Config.MCP, logger)
+	if err != nil {
+		return nil, err
+	}
+	a.mcpProvider = provider
+	if closer, ok := provider.(io.Closer); ok {
+		a.mcpCloser = closer
+	}
+	a.mcpInit = true
+	return a.mcpProvider, nil
+}
+
+func newPromptBuilder(
+	cfg config.Config,
+	repos sqlitestore.Repositories,
+	provider memory.Provider,
+) *PromptBuilder {
+	builder := NewPromptBuilder(repos, provider, workspacectx.NewLoader(cfg.Workspace.Root))
+	builder.Skills = skillsctx.NewLoader(skillsctx.LoaderConfig{
+		Enabled:          cfg.Skills.Enabled,
+		Root:             skillsctx.ResolveRoot(cfg.Workspace.Root, cfg.Skills.Root),
+		MaxEntries:       cfg.Skills.MaxEntries,
+		MaxInline:        cfg.Skills.MaxInline,
+		MaxBytesPerSkill: cfg.Skills.MaxBytesPerSkill,
+		MaxPromptBytes:   cfg.Skills.MaxPromptBytes,
+	})
+	return builder
 }
 
 func resolveMemoryProvider(cfg config.Config) memory.Provider {

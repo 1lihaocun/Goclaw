@@ -1,8 +1,6 @@
 package config
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
@@ -112,6 +110,12 @@ var feishuAccountEnvFields = []feishuAccountEnvField{
 		},
 	},
 	{
+		Suffix: "_STREAMING_TOOL_SUMMARIES",
+		Apply: func(account *FeishuAccountConfig, value string) {
+			account.StreamingToolSummaries = strings.TrimSpace(value)
+		},
+	},
+	{
 		Suffix: "_PROCESSING_ACK_EMOJI",
 		Apply: func(account *FeishuAccountConfig, value string) {
 			account.ProcessingAckEmoji = strings.TrimSpace(value)
@@ -186,10 +190,7 @@ var feishuAccountEnvFields = []feishuAccountEnvField{
 func Load(options LoadOptions) (Config, error) {
 	cfg := Default()
 
-	configPath := strings.TrimSpace(options.Path)
-	if configPath == "" {
-		configPath = firstPresentEnv("GOCLAW_CONFIG_PATH", "GOCLAW_CONFIG")
-	}
+	configPath := resolveConfiguredPath(options.Path)
 	if configPath != "" {
 		if err := loadFile(&cfg, configPath); err != nil {
 			return Config{}, err
@@ -197,6 +198,7 @@ func Load(options LoadOptions) (Config, error) {
 	}
 
 	applyEnv(&cfg)
+	cfg.SourcePath = configPath
 	return cfg, nil
 }
 
@@ -212,22 +214,31 @@ func loadFile(cfg *Config, path string) error {
 		return fmt.Errorf("read config file %q: %w", path, err)
 	}
 
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(cfg); err != nil {
+	if err := decodeConfigJSON(data, cfg); err != nil {
 		return fmt.Errorf("decode config file %q: %w", path, err)
 	}
 	return nil
+}
+
+func resolveConfiguredPath(path string) string {
+	configPath := strings.TrimSpace(path)
+	if configPath != "" {
+		return configPath
+	}
+	return firstPresentEnv("GOCLAW_CONFIG_PATH", "GOCLAW_CONFIG")
 }
 
 func applyEnv(cfg *Config) {
 	applyAppEnv(cfg)
 	applyDatabaseEnv(cfg)
 	applyWorkspaceEnv(cfg)
+	applyGatewayEnv(cfg)
 	applyFeishuEnv(cfg)
 	applyModelEnv(cfg)
 	applyMemoryEnv(cfg)
 	applyToolingEnv(cfg)
+	applyMCPEnv(cfg)
+	applySkillsEnv(cfg)
 }
 
 func applyAppEnv(cfg *Config) {
@@ -244,6 +255,16 @@ func applyWorkspaceEnv(cfg *Config) {
 	applyStringEnv(&cfg.Workspace.Root, "GOCLAW_WORKSPACE_ROOT")
 }
 
+func applyGatewayEnv(cfg *Config) {
+	applyBoolEnv(&cfg.Gateway.Restart.Enabled, "GOCLAW_GATEWAY_RESTART_ENABLED")
+	applyIntEnv(&cfg.Gateway.Restart.MaxAttempts, "GOCLAW_GATEWAY_RESTART_MAX_ATTEMPTS")
+	applyIntEnv(&cfg.Gateway.Restart.InitialBackoffSeconds, "GOCLAW_GATEWAY_RESTART_INITIAL_BACKOFF_SECONDS")
+	applyIntEnv(&cfg.Gateway.Restart.MaxBackoffSeconds, "GOCLAW_GATEWAY_RESTART_MAX_BACKOFF_SECONDS")
+	applyBoolEnv(&cfg.Gateway.Control.Enabled, "GOCLAW_GATEWAY_CONTROL_ENABLED")
+	applyStringEnv(&cfg.Gateway.Control.Host, "GOCLAW_GATEWAY_CONTROL_HOST")
+	applyIntEnv(&cfg.Gateway.Control.Port, "GOCLAW_GATEWAY_CONTROL_PORT")
+}
+
 func applyFeishuEnv(cfg *Config) {
 	applyFeishuTopLevelEnv(&cfg.Channels.Feishu, "GOCLAW_FEISHU_")
 	applyFeishuTopLevelEnv(&cfg.Channels.Feishu, "GOCLAW_CHANNELS_FEISHU_")
@@ -254,6 +275,7 @@ func applyFeishuTopLevelEnv(cfg *FeishuConfig, prefix string) {
 	applyBoolEnv(&cfg.Enabled, prefix+"ENABLED")
 	applyStringEnv(&cfg.DefaultAccount, prefix+"DEFAULT_ACCOUNT")
 	applyStringEnv(&cfg.RenderMode, prefix+"RENDER_MODE")
+	applyStringEnv(&cfg.StreamingToolSummaries, prefix+"STREAMING_TOOL_SUMMARIES")
 	applyBoolEnv(&cfg.Actions.ProcessingAck, prefix+"ACTIONS_PROCESSING_ACK")
 	applyBoolEnv(&cfg.Actions.MessageSend, prefix+"ACTIONS_MESSAGE_SEND")
 	applyBoolEnv(&cfg.Actions.MessageUpdate, prefix+"ACTIONS_MESSAGE_UPDATE")
@@ -350,6 +372,19 @@ func applyMemoryEnv(cfg *Config) {
 func applyToolingEnv(cfg *Config) {
 	applyBoolEnv(&cfg.Tooling.LegacyJSONFallbackEnabled, "GOCLAW_TOOLING_LEGACY_JSON_FALLBACK_ENABLED")
 	applyIntEnv(&cfg.Tooling.MaxIterations, "GOCLAW_TOOLING_MAX_ITERATIONS")
+}
+
+func applyMCPEnv(cfg *Config) {
+	applyBoolEnv(&cfg.MCP.Enabled, "GOCLAW_MCP_ENABLED")
+}
+
+func applySkillsEnv(cfg *Config) {
+	applyBoolEnv(&cfg.Skills.Enabled, "GOCLAW_SKILLS_ENABLED")
+	applyStringEnv(&cfg.Skills.Root, "GOCLAW_SKILLS_ROOT")
+	applyIntEnv(&cfg.Skills.MaxEntries, "GOCLAW_SKILLS_MAX_ENTRIES")
+	applyIntEnv(&cfg.Skills.MaxInline, "GOCLAW_SKILLS_MAX_INLINE")
+	applyIntEnv(&cfg.Skills.MaxBytesPerSkill, "GOCLAW_SKILLS_MAX_BYTES_PER_SKILL")
+	applyIntEnv(&cfg.Skills.MaxPromptBytes, "GOCLAW_SKILLS_MAX_PROMPT_BYTES")
 }
 
 func applyStringEnv(target *string, key string) {

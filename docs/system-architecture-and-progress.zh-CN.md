@@ -27,7 +27,7 @@ GoClaw 当前采用的核心方向是：
 - 以 **Room** 作为聊天空间层，通常对应一个飞书 `chat_id`。
 - 以 **Conversation** 作为 room 内部的逻辑话题层，用来承载独立的规则、记忆设定和局部上下文。
 - 以 **可插拔 memory provider + 本地 Markdown durable memory** 的双层记忆模型为目标。
-- 对外部聊天面当前保持 **final-only** 交付，不向外部渠道发送 streaming/partial reply。
+- 对外部聊天面默认保持 **final-only** 交付，但 Feishu 已开始支持受条件控制的 Phase 1 流式交付，并在 provider 内部按标准能力自动选择 CardKit 或消息更新流。
 
 ### 2. 领域模型分层
 
@@ -152,7 +152,7 @@ flowchart TB
 - 外部渠道只发 final reply。
 - 记忆沉淀走 post-reply jobs，不强绑定在 reply latency 上。
 - consent、conversation settings、tool policy 都属于 run 前确定的控制面。
-- streaming 设计已立项，但还没成为对外可见默认能力。
+- streaming 还不是全渠道默认能力，但 Feishu Phase 1 已经可对外可见。
 
 ---
 
@@ -318,8 +318,9 @@ flowchart TB
 - `docs/plans/2026-03-11-memory-layering-design.md`
 - `docs/plans/2026-03-11-capability-prompt-design.md`
 - `docs/plans/2026-03-10-streaming-runtime-design.md`
+- `docs/plans/2026-03-13-gateway-layer-design.md`
 
-其他线程如果继续写“记忆、能力披露、runtime streaming”相关内容，建议优先对齐这些设计稿。
+其他线程如果继续写“记忆、能力披露、runtime streaming、gateway 抽层”相关内容，建议优先对齐这些设计稿。
 
 ---
 
@@ -518,7 +519,7 @@ flowchart TB
   - runtime limits
   - tool policy summary
 - tool loop 的 session context 已经补齐 provider message 语义，不再把内部 `msg:feishu:...` 误传成渠道原始 `message_id`。
-- final-only 外部交付边界仍然保持，但运行时内部已经具备：
+- final-only 仍然是大多数渠道和 tool lifecycle 默认隐藏场景的外部交付边界，但运行时内部已经具备：
   - capability prompt snapshot
   - native tool execution
   - audit hooks
@@ -528,29 +529,109 @@ flowchart TB
   - 开始处理时设置
   - 正常回复后清除
   - 生成失败也清除
+- streaming phase 1 已经开始落地：
+  - model 层新增统一 `StreamProvider`
+  - `openai-compatible` 已支持 `completions / responses / codex-responses` SSE 文本流
+  - `Anthropic` 已支持 `/v1/messages` SSE 文本流
+  - Feishu outbound 已支持双后端 streaming delivery：
+    - CardKit streaming card create / update / close
+    - `post/text` 发送后通过消息更新维持同一条流式消息
+    - `message update` 链路已修正为 Feishu 标准文本/富文本编辑语义：
+      - 使用 `PUT /im/v1/messages/{message_id}`
+      - 请求体显式携带 `msg_type + content`
+      - 避免把非卡片消息误打到 `PATCH` card update
+    - `message update` session 已补充 delivery control：
+      - 会对高频 delta 做限频合并，而不是每个 token 都直接编辑消息
+      - 命中 Feishu 单消息编辑次数上限时，会退化为补发一条新的最终消息，而不是把整次 reply 直接判失败
+    - `renderMode=auto` 的 streaming session 现在已补首段缓冲：
+      - 首个不确定文本前缀不会立刻锁死成 message-update backend
+      - 如果后续累计文本出现表格/代码块，仍可直接起 CardKit streaming card
+      - 这一步是为后续 `ReplyRenderAdapter` 过渡，不是最终 render boundary 终态
+  - `ReplyService` 已优先尝试 streaming path，并在失败时回退同步 `Generate()`
+- runtime event 骨架已经开始落地：
+  - 已新增最小 `RunEvent` / `RunObserver` 模型
+  - 当前事件已带稳定 `run_id` 与单 run 内递增 `sequence`
+  - 当前已正式使用的事件包括 `run_started`、`assistant_started`、`assistant_delta`、`assistant_block`、`final_text`、`run_completed`、`run_failed`
+  - Feishu streaming delivery session 现在作为 required delivery observer 接入
+  - 额外 internal observers 现在走 best-effort，不会把主回复链路拖死
+- `RunSnapshot` 也已开始落地：
+  - 当前一轮 reply 会先冻结 `RunSnapshot`
+  - `ReplyPlan` 不再在 streaming path / final-only path 里重复构建
+  - `RunSnapshot` 现在已显式承载 `run_id`、`started_at`、`profile/person/room/conversation/session`、`conversation_settings`、`consent`、`retrieval`、`memory_hits`、`prompt`、`tool_policy`、`tooling_mode`
+  - prompt / retrieval / memory hits / tool policy 等可变切片与 map 现在会在 snapshot 内冻结拷贝，避免 mid-run 漂移
+- tool loop 事件已经接进同一条 runtime 语义：
+  - legacy tool loop 与 native tool loop 现在都会先发 `assistant_block(tool_call)`，再发 `tool_call_started`、`tool_result`、`tool_call_finished`
+  - 普通 final-only run 也会发 `run_started`、`final_text`、`run_completed`
+  - 这样 streaming path、tool path、plain final-only path 已经不再各自维护一套完全独立的运行时语义
+- `ReplyProjector` / `ReplyDelivery` 已进入代码：
+  - projector 默认把 `assistant_delta` 投影为可见文本
+  - `assistant_block(tool_call)` 和 tool lifecycle 默认隐藏，但会保留 hidden boundary，避免文本拼接成 `checkedthat`
+  - `final_text` 会投影为 final delivery
+  - terminal event 会触发 flush/reset
+- 最小 `ReplyBlockChunker` 已进入 runtime：
+  - plain text 仍可继续即时流式
+  - heading lead-in / 未闭合 fenced block 等不稳定 markdown 片段会先缓冲
+  - 当前仍是过渡实现，后续还需要更正式的 `ReplyRenderAdapter`
+- tool-mode run 与 delivery session 的边界已经收紧到更合理的形态：
+  - 非 tool 的 token streaming 继续走原有 provider stream path
+  - tool-enabled room 不再因为开启 tool loop 就直接放弃 delivery session
+  - 如果 outbound 支持 streaming session，则 tool-mode run 会走 `RunEvent -> ReplyProjector -> projected session`
+  - 当前对外仍默认隐藏 tool lifecycle，只在 session close 时交付 final text
+- tool lifecycle 可见性控制已经接进正式配置面：
+  - 新增 `channels.feishu.streamingToolSummaries`
+  - 支持 `off | dm_only | all`
+  - 默认 `off`
+  - account 级可覆盖 top-level 配置
+- Feishu 已经有最小可生产的 tool companion message：
+  - runtime 通过 `ToolStreamingReplySession` 把 `ReplyDeliveryTool` 投递给渠道 session
+  - Feishu 会按 `toolCallId` 维护独立 companion message
+  - 同一 `toolCallId` 优先编辑同一条消息，不再重复新发
+  - 当前 companion message 优先走 `text`，否则回退 `post`
+  - 这条 lane 与主 assistant text lane 分离，避免把工具摘要混进正文流式消息
 
 #### 当前状态
 
-- 运行时正在从“单次 reply 逻辑”演进到更正式的 run-time control plane，但 streaming 仍不是默认对外能力。
-- 当前对外稳定边界依然是：
-  - 外部渠道只发 final reply
-  - 内部可以有 tool loop、capability snapshot、post-run jobs
+- 运行时正在从“单次 reply 逻辑”演进到更正式的 run-time control plane，streaming 也已经从纯设计态进入可运行实现。
+- 当前对外稳定边界是：
+  - Feishu 普通文本回复在满足条件时可走流式交付：
+    - 复杂 markdown 优先走 CardKit streaming card
+    - 普通文本优先走 message update stream
+  - tool loop 默认仍只对外显示 final 文本，但现在已经可以按 `streamingToolSummaries` 策略选择是否外显 tool summary：
+    - `off`：全部隐藏
+    - `dm_only`：仅 direct chat 外显
+    - `all`：direct/group 都外显
+  - 一旦外显，Feishu 会用独立 tool companion message 承载工具摘要，而不是污染主回复正文
+  - 非 streaming outbound、非 streaming provider 仍走 final-only
+  - 内部继续保留 capability snapshot、tool loop、post-run jobs，以及统一的最小 run event observer 骨架
+- Feishu 当前的 provider 内部策略已经稳定成：
+  - `renderMode=card` 优先 CardKit
+  - `renderMode=raw` 优先 message update
+  - `renderMode=auto` 按内容复杂度自动选择
+  - CardKit 建连失败时，如可行则自动回退到 message update
+  - operator CLI `goclaw feishu message update` 现已支持 `--msg-type`，与 `send/reply` 的 text/post 语义对齐
 - runtime 现在已经会把一次回复尝试记录成可审计 run，而不是只留下日志：
   - `agent_reply_runs` 记录 run 生命周期
   - `tool_invocations` 记录每次工具调用生命周期
 - 对 `openai-completions`，运行时这条线已经不只是依赖 provider 自然收敛，还会通过 transcript repair、并行工具提示和 exploration hint 主动减少无效回合。
-- 这条线程补的是 runtime correctness 和 control plane 收口，不是完整 streaming event bus。
+- 这条线程这次补的是 “可生产演进的 streaming phase 1 + 最小 run event 骨架”，不是完整 streaming event bus。
+- 截至 2026-03-14，受影响包测试已通过：
+  - `go test ./internal/config ./internal/runtime ./internal/channels/feishu ./internal/feishu`
+- 当前全量 `go test ./...` 仍可能命中 gateway/control 线程外基线差异，这不是本线程这批 runtime/feishu streaming 改动直接引入的问题。
 
 #### 仍待补充
 
-- Run Snapshot / Run Event 的正式模型
-- internal streaming 与 external final-only 的完整分层
-- finalizer / event bus / observer 链路的统一说明
+- 让更多 runtime 子模块只直接消费 `RunSnapshot`
+- tool loop 的更细粒度流式事件化
+- internal streaming 与 external delivery lane 的更细分层
+- finalizer / event bus / observer 链路的进一步统一说明
+- 非 Feishu 渠道的 partial delivery 适配
 
 #### 设计稿索引
 
 - `docs/plans/2026-03-11-tooling-runtime-design.md`
 - `docs/plans/2026-03-10-streaming-runtime-design.md`
+- `docs/plans/2026-03-12-feishu-streaming-phase-1-design.md`
+- `docs/plans/2026-03-13-tool-streaming-openclaw-alignment-plan.md`
 
 ---
 
@@ -558,11 +639,30 @@ flowchart TB
 
 这一节不按单线程写，而是从整个项目角度记录当前最值得并行推进的缺口。
 
-### 1. streaming runtime 正式落地
+### 1. streaming runtime phase 2
 
-- 当前外部 final-only 边界已经稳定，但内部 `RunSnapshot` / `RunEvent` / finalizer / observer 还停留在设计态。
-- 后续如果有线程负责 runtime streaming，建议优先对齐：
+- streaming phase 1 已完成：文本流式、Feishu 双后端流式交付、provider stream fallback、tool-mode projected session fallback 都已落地。
+- streaming runtime 已不再是“纯 provider 直推 channel”：
+  - 最小 `RunEvent` / `RunObserver` 骨架已经接入当前 streaming 主链路
+  - 事件已经带稳定 `run_id` 和递增 `sequence`
+  - delivery observer 与 best-effort internal observer 已做职责分层
+  - `ReplyProjector` / `ReplyDelivery` 已进入 runtime，并承担最小文本投影与 hidden boundary 语义
+- `RunSnapshot` 正式模型也已进入代码：
+  - 当前 run 前会显式冻结 consent / retrieval / memory hits / tool policy / tooling mode
+  - prompt 与控制面里的可变切片 / map 会先复制后再进入 run
+- tool loop 和 plain final-only run 也已经接入这套最小事件语义：
+  - `assistant_block(tool_call)` / `tool_call_started` / `tool_result` / `tool_call_finished` 已可被统一观察
+  - `run_started` / `final_text` / `run_completed` 不再只存在于 streaming path
+- 当前下一阶段更值得推进的是：
+  - 让更多 runtime 路径只以 `RunSnapshot` 为输入边界
+  - `ReplyBlockChunker` / `ReplyRenderAdapter` / delivery coordinator
+  - tool loop 的 assistant text / reasoning 更细粒度事件
+  - 非 Feishu 渠道 partial delivery
+  - 更统一的 observer / finalizer 说明
+- 后续如果有线程继续做 runtime streaming，建议优先对齐：
   - `docs/plans/2026-03-10-streaming-runtime-design.md`
+  - `docs/plans/2026-03-12-feishu-streaming-phase-1-design.md`
+  - `docs/plans/2026-03-13-tool-streaming-openclaw-alignment-plan.md`
 
 ### 2. provider-native tooling 继续扩展和收敛
 
@@ -579,6 +679,125 @@ flowchart TB
 - 当前 Feishu channel tools、capability summary、room policy 已经形成一条正式链路。
 - 但更完整的风险分级、故障排查、跨渠道对比说明还没补齐。
 
+### 5. gateway 外壳和 channel lifecycle manager
+
+- `gateway.Server` 的第一刀已经落地：
+  - `goclaw serve` 现在通过正式 gateway 层启动
+  - process-level transport orchestration 已从 `runtime` 抽离
+  - `/healthz` 也跟着进入 gateway 层
+- `ChannelManager` 的最小快照也已经落地：
+  - `channels` 层现在能上报 provider-agnostic account snapshot
+  - `channels` contract 现在已经进一步拆成三层：
+    - account config 视图
+    - transport runtime 视图
+    - account lifecycle spec / controller 视图
+  - gateway 现在能维护最小 channel/account 状态：
+    - `disabled`
+    - `not_configured`
+    - `idle`
+    - `running`
+    - `failed`
+  - gateway 已能输出最小 `StatusSnapshot`
+    - 顶层 `ready`
+    - 顶层 `issues`
+    - account 级 channel snapshots
+  - 当前 readiness 规则已经落地：
+    - enabled 但未配置的 account 会让 gateway 进入 `not ready`
+    - runtime `failed` 的 account 会被聚合进 `issues`
+- `channels.Registry` 现在已经能继续聚合：
+  - `TransportSnapshots()`
+  - `AccountLifecycleSpecs()`
+  - `StartAccount(...)`
+  - `StopAccount(...)`
+  - `RestartAccount(...)`
+  - 但当前还只是 contract 和 dispatch 入口，gateway operator 还没有真正消费这些接口
+- Feishu channel 当前已经把 account/runtime 关系表达得更清楚：
+  - webhook account 会归并到 shared runtime：
+    - `webhook[host:port]`
+  - longpoll account 会映射到 dedicated runtime：
+    - `feishu[account:longpoll]`
+  - webhook 和 longpoll 都已经能通过 `AccountLifecycleSpec` 说明：
+    - 当前是否 operator-managed
+    - 是否支持 start / stop / restart
+    - 当前为什么还不支持
+  - 截至这次线程完成时，Feishu 仍然是：
+    - `operatorManaged=false`
+    - webhook 因 shared listener 不支持 account 级 lifecycle
+    - longpoll 虽然 runtime 形态已是 dedicated，但还没切到 channel-owned lifecycle hook
+- restart/backoff 骨架也已落地，但默认保持关闭：
+  - gateway restart 配置已进入 `config`
+  - channel transports 已接入可选 supervisor
+  - memory workers 暂不进入 supervisor
+  - channel/account 状态新增：
+    - `backing_off`
+    - `restart_enabled`
+    - `max_restart_attempts`
+    - `restart_count`
+    - `last_failure_at`
+    - `next_retry_at`
+  - `backing_off` 也会被聚合进 gateway `issues`
+- transport inventory 也已落地：
+  - `gateway status` 现在能同时输出 `channels` 和 `transports`
+  - transport 维度已区分：
+    - `channel`
+    - `worker`
+  - 当前最小 transport 视图已包含：
+    - name
+    - source
+    - kind
+    - managed
+    - address
+    - bindings
+    - running / state
+    - restart/backoff metadata
+  - worker transport 失败也会进入 gateway `issues`
+- CLI 已新增最小 operator 入口：
+  - `goclaw gateway status`
+- gateway operator shell 现在也已经有了下一层入口：
+  - `goclaw gateway inspect`
+  - `goclaw gateway start`
+  - `goclaw gateway stop`
+  - `goclaw gateway restart`
+  - 最初这一层只是：
+    - 统一 account target 解析
+    - 统一 inspect 视图输出
+    - 统一 lifecycle dispatch / unsupported surface
+  - 但现在已经继续补成了最小本机 control plane：
+    - `internal/gateway/control_ui.go` 已新增：
+      - `GET /api/control/channels/inspect`
+      - `POST /api/control/channels/start`
+      - `POST /api/control/channels/stop`
+      - `POST /api/control/channels/restart`
+    - `cmd/goclaw/gateway_command.go` 现在会优先连接正在运行中的 control API
+    - 只有 control API 不可达时，才回退到离线本地逻辑
+  - 当前还没做到的是：
+    - 跨机器、带鉴权的完整 control plane
+    - 对 shared webhook listener 做真实的 per-account start/stop
+- `gateway inspect` 现在会把一个 account 的几层信息一次性拉平给 operator：
+  - `account`
+  - `runtime`
+  - `lifecycle`
+  - `transport`
+  - `transport_status`
+  - account 级 `issues`
+- 当前 Feishu 的 operator 行为已经是稳定定义：
+  - `inspect` 可直接使用
+  - webhook 的 `start/stop/restart` 会继续返回结构化 unsupported
+  - longpoll 在未绑定 runtime host 的离线场景里也会返回结构化 unsupported
+  - 但在真实 `gateway.Server` 运行上下文里，Feishu longpoll 已经有真正的 channel-owned lifecycle controller
+  - 也就是：
+    - longpoll 已完成真实接管
+    - CLI 在 `serve` 运行时已能优先命中真实 gateway 进程
+    - 离线场景仍只会看到本地静态 / unsupported 结果
+- 当前更合适的下一步仍然不是一次性复制 OpenClaw 整套重控制面，而是继续补：
+  - 更强的 operator UI / transport drill-down
+  - 更完整的 remote operator surface / 鉴权控制面
+  - 更完整的 transport inspect 细节
+  - shared listener 下的精细化控制
+- 这条线的设计稿见：
+  - `docs/plans/2026-03-13-gateway-layer-design.md`
+  - `docs/plans/2026-03-13-openclaw-gateway-channel-two-thread-plan.md`
+
 ---
 
 ## 七、当前我对项目状态的判断
@@ -593,9 +812,10 @@ flowchart TB
 
 但整个系统距离“生产版本”还有这些共性缺口：
 
-- streaming runtime 还没有完整落地。
+- streaming runtime 已经完成 Phase 1，但还没有收口成完整事件总线架构。
 - 多 provider 的 native structured tooling 主干已经立住，但还未完全收敛到完整矩阵。
 - channel tool fabric 还在持续演进。
+- gateway 外圈承载层已经开始抽离，最小 `ChannelManager` / `StatusSnapshot` / `gateway status` 已进入代码；`gateway inspect/start/stop/restart` 已经从 operator shell 继续补成了最小本机 remote control plane，CLI 会优先命中正在运行中的 control API。Feishu longpoll 这一支已经切到真实的 channel-owned lifecycle controller，但 shared listener 下的真实 account lifecycle 切换、更强的 operator UI / 鉴权控制面，以及更完整的 transport inspect 细节还没有补齐。
 - 运行时审计与 operator 面已经有第一版，但更强的运维可观测性和最终生产化收尾还没完成。
 
 ---

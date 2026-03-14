@@ -26,6 +26,8 @@ GoClaw is a Go-based chat runtime built around person-centered isolation.
 - `internal/memory`: memory provider abstraction
 - `internal/runtime`: application bootstrap and wiring
 - `internal/store/sqlite`: SQLite store boundary
+- `internal/mcp`: MCP stdio client and provider adapter
+- `internal/skills`: prompt-only skill loader
 
 Feishu connector details live in:
 
@@ -159,6 +161,7 @@ Feishu connector details live in:
   - `goclaw conversations settings set`
 - Model requests now include a formal capability prompt that tells the model about:
   - visible tools
+  - visible prompt-only skills
   - memory scopes
   - consent-driven personal memory limits
   - final-only delivery constraints
@@ -171,6 +174,8 @@ Feishu connector details live in:
   - file reads
   - file writes
   - HTTP fetches
+- MCP stdio servers can now be exposed as room-governed tools through the same `agenttools` registry and audit path.
+- Workspace skills can now be loaded from `skills/*/SKILL.md` and injected into the system prompt as guidance-only capability blocks.
 - The reply loop now supports native `Anthropic` tool calling under room policy, with the older guarded JSON tool protocol retained as a fallback for providers that do not expose native tools yet.
 
 ## Configuration model
@@ -204,7 +209,7 @@ The stable shape for chat carriers is now:
       "accounts": {
         "main": {
           "profileId": "main",
-          "renderMode": "card",
+          "renderMode": "auto",
           "processingAckEmoji": "EYES",
           "actions": {
             "processingAck": false
@@ -214,6 +219,33 @@ The stable shape for chat carriers is now:
         }
       }
     }
+  }
+}
+```
+
+The config file can now also expose workspace-backed skills and MCP servers:
+
+```json
+{
+  "workspace": {
+    "root": "var/workspace"
+  },
+  "mcp": {
+    "enabled": true,
+    "servers": {
+      "github": {
+        "command": "github-mcp-server",
+        "args": ["stdio"],
+        "safetyClass": "read_only",
+        "toolPrefix": "github"
+      }
+    }
+  },
+  "skills": {
+    "enabled": true,
+    "root": "var/workspace/skills",
+    "maxEntries": 32,
+    "maxInline": 4
   }
 }
 ```
@@ -235,7 +267,7 @@ export GOCLAW_CHANNELS_FEISHU_ACTIONS_REACTIONS=true
 export GOCLAW_CHANNELS_FEISHU_ACTIONS_DOCS_READ=true
 export GOCLAW_CHANNELS_FEISHU_PROCESSING_ACK_EMOJI=EYES
 export GOCLAW_CHANNELS_FEISHU_ACCOUNTS_MAIN_PROFILE_ID=main
-export GOCLAW_CHANNELS_FEISHU_ACCOUNTS_MAIN_RENDER_MODE=card
+export GOCLAW_CHANNELS_FEISHU_ACCOUNTS_MAIN_RENDER_MODE=auto
 export GOCLAW_CHANNELS_FEISHU_ACCOUNTS_MAIN_ACTIONS_PROCESSING_ACK=false
 export GOCLAW_CHANNELS_FEISHU_ACCOUNTS_MAIN_APP_ID=cli_test
 export GOCLAW_CHANNELS_FEISHU_ACCOUNTS_MAIN_APP_SECRET=secret_test
@@ -269,7 +301,7 @@ An example file lives at `goclaw.example.json`.
       "accounts": {
         "main": {
           "profileId": "main",
-          "renderMode": "card",
+          "renderMode": "auto",
           "processingAckEmoji": "DONE"
         }
       }
@@ -431,6 +463,29 @@ To enable workspace-backed Markdown rules and durable memory, add:
 
 - `GOCLAW_WORKSPACE_ROOT=var/workspace`
 
+To enable MCP and workspace skills, add:
+
+- `GOCLAW_MCP_ENABLED=true`
+- `GOCLAW_SKILLS_ENABLED=true`
+- `GOCLAW_SKILLS_ROOT=var/workspace/skills`
+
+The current workspace skill layout is:
+
+- `skills/<skill_name>/SKILL.md`
+
+Current extension inventory can be inspected with:
+
+```bash
+go run ./cmd/goclaw mcp list
+go run ./cmd/goclaw skills list
+```
+
+Room permissions now cover three execution surfaces:
+
+- local commands, filesystem paths, and network hosts
+- channel tools
+- MCP tools and MCP servers
+
 Tool permissions can be inspected and updated with:
 
 ```bash
@@ -442,10 +497,15 @@ go run ./cmd/goclaw permissions set --profile-id main --room-id oc_room_1 \
   --allow-commands git,bash \
   --allow-paths /tmp/work \
   --allow-hosts api.anthropic.com
+go run ./cmd/goclaw permissions set --profile-id main --room-id oc_room_1 \
+  --mcp-read-mode allow_list \
+  --allow-mcp-servers github
 go run ./cmd/goclaw permissions check --profile-id main --room-id oc_room_1 \
   --kind command \
   --command "git status"
 ```
+
+Once MCP permissions are granted, MCP tools show up in the model-visible capability prompt and in tooling audit rows with `tool_source=mcp`.
 
 Guarded local tools can then be run with:
 

@@ -1,0 +1,491 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>GoClaw Control</title>
+    <style>
+      :root {
+        --bg: #0e1110;
+        --panel: rgba(22, 27, 25, 0.88);
+        --panel-soft: rgba(255, 255, 255, 0.04);
+        --line: rgba(243, 202, 126, 0.18);
+        --text: #f7efde;
+        --muted: #c9bda7;
+        --accent: #f2a65a;
+        --ok: #7cd5a1;
+        --warn: #ffd56d;
+        --danger: #ff846f;
+        --radius: 20px;
+        --mono: "IBM Plex Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+        --serif: "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+      }
+
+      * { box-sizing: border-box; }
+      html, body { margin: 0; min-height: 100%; background:
+        radial-gradient(circle at top left, rgba(242,166,90,.16), transparent 28%),
+        radial-gradient(circle at right 20%, rgba(90,170,134,.12), transparent 24%),
+        linear-gradient(140deg, #0b0d0d, #111615 40%, #0a0d0c);
+        color: var(--text); font-family: var(--mono); }
+      body::before { content: ""; position: fixed; inset: 0; pointer-events: none; opacity: .18;
+        background-image:
+          linear-gradient(rgba(255,255,255,.05) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(255,255,255,.05) 1px, transparent 1px);
+        background-size: 28px 28px; mask-image: radial-gradient(circle at center, black, transparent 82%); }
+
+      main { width: min(1460px, calc(100vw - 24px)); margin: 16px auto 28px; }
+      .panel {
+        background: linear-gradient(180deg, rgba(24, 29, 28, .96), rgba(14, 18, 17, .96));
+        border: 1px solid var(--line); border-radius: var(--radius);
+        box-shadow: 0 30px 90px rgba(0,0,0,.35); overflow: hidden;
+      }
+      .panel::before { content: ""; position: absolute; inset: 0; pointer-events: none; }
+      .hero, .layout { display: grid; gap: 16px; }
+      .hero { grid-template-columns: minmax(0, 1.4fr) minmax(320px, .9fr); margin-bottom: 16px; }
+      .layout { grid-template-columns: minmax(300px, .88fr) minmax(0, 1.52fr); }
+      .hero-copy, .hero-side, .overview, .editor { position: relative; padding: 24px; }
+      .eyebrow {
+        display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: 999px;
+        border: 1px solid rgba(242,166,90,.32); background: rgba(242,166,90,.08);
+        font-size: 12px; letter-spacing: .12em; text-transform: uppercase; color: #ffd39b;
+      }
+      h1, h2, h3, h4 { margin: 0; font-family: var(--serif); letter-spacing: -.03em; }
+      h1 { margin-top: 16px; font-size: clamp(42px, 6vw, 78px); line-height: .95; }
+      h2 { font-size: 32px; }
+      h3 { font-size: 24px; }
+      p { color: var(--muted); line-height: 1.7; }
+      .stat-row, .button-row, .tabs { display: flex; flex-wrap: wrap; gap: 10px; }
+      .stat-row { margin-top: 20px; }
+      .stat { min-width: 132px; padding: 14px 16px; border-radius: 16px; border: 1px solid rgba(255,255,255,.08); background: rgba(255,255,255,.04); }
+      .stat span { display: block; color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+      .stat strong { font-size: 24px; }
+      .meta { padding: 16px 18px; border-radius: 16px; border: 1px solid rgba(255,255,255,.08); background: rgba(255,255,255,.04); }
+      .meta + .meta { margin-top: 12px; }
+      .meta a { color: #ffd39b; text-decoration: none; }
+
+      button {
+        appearance: none; border: 1px solid transparent; border-radius: 999px; cursor: pointer;
+        padding: 12px 16px; font: inherit; font-size: 13px; transition: transform .15s ease, opacity .15s ease;
+      }
+      button:hover { transform: translateY(-1px); }
+      button:disabled { opacity: .55; cursor: not-allowed; transform: none; }
+      .primary { background: linear-gradient(135deg, var(--accent), #ffca79); color: #1b140e; box-shadow: 0 14px 30px rgba(242,166,90,.26); }
+      .secondary { background: rgba(255,255,255,.08); color: var(--text); border-color: rgba(255,255,255,.08); }
+      .ghost { background: transparent; color: var(--muted); border-color: rgba(255,255,255,.1); }
+
+      .chip { display: inline-flex; align-items: center; padding: 8px 12px; border-radius: 999px; font-size: 12px; border: 1px solid transparent; }
+      .chip.ok { color: var(--ok); background: rgba(124,213,161,.12); border-color: rgba(124,213,161,.26); }
+      .chip.warn { color: var(--warn); background: rgba(255,213,109,.12); border-color: rgba(255,213,109,.26); }
+      .chip.danger { color: var(--danger); background: rgba(255,132,111,.12); border-color: rgba(255,132,111,.26); }
+
+      .stack, .cards, .fields, .list, .collection { display: grid; gap: 12px; }
+      .cards, .fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .notice, .issue, .card, .subcard, .field, .row {
+        border-radius: 16px; border: 1px solid rgba(255,255,255,.08); background: rgba(255,255,255,.035);
+      }
+      .notice, .issue, .subcard, .field, .row { padding: 14px; }
+      .issue { border-color: rgba(255,132,111,.2); background: rgba(255,132,111,.08); color: #ffd6cf; }
+      .card { padding: 18px; }
+      .row strong { display: block; margin-bottom: 6px; font-size: 13px; }
+      .row span, .row code { color: var(--muted); font-size: 12px; line-height: 1.6; }
+      .tabs { padding: 6px; border-radius: 999px; border: 1px solid rgba(255,255,255,.08); background: rgba(255,255,255,.04); }
+      .tab { background: transparent; color: var(--muted); }
+      .tab.active { background: rgba(242,166,90,.16); color: #ffd39b; }
+      .toolbar { display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+      .panel-tab { display: none; }
+      .panel-tab.active { display: block; }
+
+      label { display: block; margin-bottom: 8px; color: #ffd39b; font-size: 12px; letter-spacing: .08em; text-transform: uppercase; }
+      input, select, textarea {
+        width: 100%; border-radius: 14px; border: 1px solid rgba(255,255,255,.12); padding: 12px 14px;
+        background: rgba(7,9,9,.65); color: var(--text); font: inherit; font-size: 13px;
+      }
+      input:focus, select:focus, textarea:focus { outline: none; border-color: rgba(242,166,90,.48); box-shadow: 0 0 0 3px rgba(242,166,90,.12); }
+      textarea { min-height: 420px; resize: vertical; line-height: 1.7; }
+      .toggle { display: flex; align-items: center; gap: 10px; }
+      .toggle input { width: 18px; height: 18px; }
+      .empty { padding: 22px; border-radius: 16px; border: 1px dashed rgba(255,255,255,.16); color: var(--muted); text-align: center; line-height: 1.7; }
+      .toast {
+        position: fixed; right: 18px; bottom: 18px; max-width: min(460px, calc(100vw - 28px));
+        padding: 16px 18px; border-radius: 16px; border: 1px solid rgba(255,255,255,.1);
+        background: rgba(9,11,11,.94); box-shadow: 0 24px 70px rgba(0,0,0,.35); opacity: 0; transform: translateY(8px);
+        pointer-events: none; transition: opacity .18s ease, transform .18s ease;
+      }
+      .toast.show { opacity: 1; transform: translateY(0); }
+      .toast.ok { border-color: rgba(124,213,161,.28); }
+      .toast.error { border-color: rgba(255,132,111,.28); }
+
+      @media (max-width: 1080px) {
+        .hero, .layout, .cards, .fields { grid-template-columns: 1fr; }
+      }
+      @media (max-width: 720px) {
+        main { width: min(100vw - 12px, 1460px); margin-top: 6px; }
+        .hero-copy, .hero-side, .overview, .editor { padding: 18px; }
+        h1 { font-size: 40px; }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section class="hero">
+        <article class="panel hero-copy">
+          <span class="eyebrow">GoClaw Control Surface</span>
+          <h1>状态看板<br>配置工作台</h1>
+          <p>这版 control UI 参考了 OpenClaw 的做法，把状态快照、文件配置和编辑体验拆成独立层次：先读 snapshot，再读 file config，再把常用字段投成 guided form，同时保留 raw JSON 兜底。</p>
+          <div class="stat-row" id="stats"></div>
+        </article>
+        <aside class="panel hero-side">
+          <div class="meta"><h3>配置文件</h3><p id="configPath">读取中…</p></div>
+          <div class="meta"><h3>控制台地址</h3><p id="controlUrl">读取中…</p></div>
+          <div class="button-row" style="margin-top:16px">
+            <button class="secondary" id="reloadBtn" type="button">重新加载</button>
+            <button class="primary" id="saveBtn" type="button">保存配置</button>
+          </div>
+          <div class="button-row" style="margin-top:12px">
+            <span class="chip warn" id="saveState">等待配置快照</span>
+          </div>
+        </aside>
+      </section>
+
+      <section class="layout">
+        <aside class="panel overview">
+          <div class="toolbar">
+            <div>
+              <h2>运行态</h2>
+              <p>这里显示的是当前进程里的 gateway / transport 状态，不是“保存后但尚未重启”的新配置状态。</p>
+            </div>
+            <span class="chip warn" id="readyState">读取中</span>
+          </div>
+          <div class="stack" id="warnings"></div>
+          <div class="stack" id="issues"></div>
+          <div class="cards">
+            <section class="card">
+              <h3>Channels</h3>
+              <div class="list" id="channels"></div>
+            </section>
+            <section class="card">
+              <h3>Transports</h3>
+              <div class="list" id="transports"></div>
+            </section>
+          </div>
+        </aside>
+
+        <section class="panel editor">
+          <div class="toolbar">
+            <div>
+              <h2>配置工作台</h2>
+              <p>Guided 页覆盖常用字段；更细的 MCP tools、Feishu actions override 继续走 Raw JSON。</p>
+            </div>
+            <div class="tabs">
+              <button class="tab active" data-tab="guided" type="button">Guided</button>
+              <button class="tab" data-tab="raw" type="button">Raw JSON</button>
+            </div>
+          </div>
+
+          <div class="panel-tab active" data-panel="guided">
+            <div class="stack" id="guided"></div>
+          </div>
+
+          <div class="panel-tab" data-panel="raw">
+            <section class="card">
+              <div class="toolbar">
+                <div>
+                  <h3>原始 JSON</h3>
+                  <p>直接编辑完整配置。点击“应用 Raw 变更”后，Guided 表单会同步到这份对象。</p>
+                </div>
+                <button class="ghost" id="applyRawBtn" type="button">应用 Raw 变更</button>
+              </div>
+              <textarea id="rawEditor" spellcheck="false"></textarea>
+            </section>
+          </div>
+        </section>
+      </section>
+    </main>
+    <div class="toast" id="toast"></div>
+    <script>
+      const SECTIONS = [
+        { title: "App & Storage", note: "应用标识、本地数据库、workspace 根路径。", fields: [
+          F("app.name","App Name"), F("app.environment","Environment"), F("database.path","Database Path"), F("workspace.root","Workspace Root")
+        ]},
+        { title: "Gateway", note: "control UI 监听和 restart policy。", fields: [
+          B("gateway.control.enabled","Control UI Enabled"), F("gateway.control.host","Control Host"), N("gateway.control.port","Control Port"),
+          B("gateway.restart.enabled","Restart Enabled"), N("gateway.restart.maxAttempts","Max Attempts"),
+          N("gateway.restart.initialBackoffSeconds","Initial Backoff Seconds"), N("gateway.restart.maxBackoffSeconds","Max Backoff Seconds")
+        ]},
+        { title: "Model", note: "主模型 provider、API 类型和认证。", fields: [
+          S("model.provider","Provider",[["noop","noop"],["echo","echo"],["openai-compatible","openai-compatible"],["anthropic","anthropic"]]),
+          S("model.api","API",[["openai-completions","openai-completions"],["openai-responses","openai-responses"],["openai-codex-responses","openai-codex-responses"],["anthropic-messages","anthropic-messages"]]),
+          F("model.baseUrl","Base URL"), F("model.modelId","Model ID"), P("model.apiKey","API Key"), B("model.authHeader","Auth Header"),
+          N("model.maxTokens","Max Tokens"), F("model.anthropicVersion","Anthropic Version"), F("model.anthropicBeta","Anthropic Beta")
+        ]},
+        { title: "Feishu Global", note: "飞书通道的全局默认值。", fields: [
+          B("channels.feishu.enabled","Feishu Enabled"), F("channels.feishu.defaultAccount","Default Account"),
+          S("channels.feishu.connectionMode","Connection Mode",[["longpoll","longpoll"],["webhook","webhook"]]),
+          S("channels.feishu.renderMode","Render Mode",[["auto","auto"],["card","card"],["raw","raw"]]),
+          F("channels.feishu.processingAckEmoji","Processing Ack Emoji"), F("channels.feishu.profileId","Profile ID"),
+          F("channels.feishu.webhookHost","Webhook Host"), N("channels.feishu.webhookPort","Webhook Port"), F("channels.feishu.webhookPath","Webhook Path"),
+          F("channels.feishu.apiBaseUrl","API Base URL"), F("channels.feishu.appId","Top-level App ID"), P("channels.feishu.appSecret","Top-level App Secret"),
+          P("channels.feishu.encryptKey","Encrypt Key"), P("channels.feishu.verificationToken","Verification Token"), N("channels.feishu.maxBodyBytes","Max Body Bytes"),
+          B("channels.feishu.actions.processingAck","Action: Processing Ack"), B("channels.feishu.actions.messageSend","Action: Message Send"),
+          B("channels.feishu.actions.messageUpdate","Action: Message Update"), B("channels.feishu.actions.messageRecall","Action: Message Recall"),
+          B("channels.feishu.actions.reactions","Action: Reactions"), B("channels.feishu.actions.pins","Action: Pins"),
+          B("channels.feishu.actions.postMessages","Action: Post Messages"), B("channels.feishu.actions.docsRead","Action: Docs Read")
+        ]},
+        { title: "Memory & Skills", note: "持久记忆、自动提炼和 workspace skills。", fields: [
+          S("memory.provider","Memory Provider",[["noop","noop"],["memos","memos"]]), B("memory.memos.enabled","MemOS Enabled"),
+          F("memory.memos.baseUrl","MemOS Base URL"), P("memory.memos.apiKey","MemOS API Key"), B("memory.autoPromote.enabled","Auto Promote Enabled"),
+          B("memory.autoPromote.weakPatternsEnabled","Weak Patterns"), B("memory.autoPromote.strongPatternsEnabled","Strong Patterns"),
+          N("memory.autoPromote.recentMessagesLimit","Recent Messages Limit"), N("memory.autoPromote.minimumEvidence","Minimum Evidence"),
+          N("memory.autoPromote.pollIntervalSeconds","Poll Interval Seconds"), B("memory.autoPromote.sources.transcript","Source: Transcript"),
+          B("memory.autoPromote.sources.journals","Source: Journals"), B("memory.autoPromote.layers.conversation","Layer: Conversation"),
+          B("memory.autoPromote.layers.room","Layer: Room"), B("memory.autoPromote.layers.personSummary","Layer: Person Summary"),
+          B("memory.autoPromote.layers.personPrivate","Layer: Person Private"), B("skills.enabled","Skills Enabled"),
+          F("skills.root","Skills Root"), N("skills.maxEntries","Skills Max Entries"), N("skills.maxInline","Skills Max Inline"),
+          N("skills.maxBytesPerSkill","Max Bytes Per Skill"), N("skills.maxPromptBytes","Max Prompt Bytes")
+        ]},
+        { title: "Tooling", note: "工具循环和 MCP 总开关。", fields: [
+          B("tooling.legacyJsonFallbackEnabled","Legacy JSON Fallback"), N("tooling.maxIterations","Max Iterations"), B("mcp.enabled","MCP Enabled")
+        ]}
+      ];
+
+      const state = { tab: "guided", status: null, config: null, draft: {}, rawDirty: false };
+      const $ = (id) => document.getElementById(id);
+      const refs = {
+        stats: $("stats"), configPath: $("configPath"), controlUrl: $("controlUrl"), saveState: $("saveState"),
+        readyState: $("readyState"), warnings: $("warnings"), issues: $("issues"), channels: $("channels"), transports: $("transports"),
+        guided: $("guided"), rawEditor: $("rawEditor"), reloadBtn: $("reloadBtn"), saveBtn: $("saveBtn"), applyRawBtn: $("applyRawBtn"), toast: $("toast")
+      };
+
+      document.querySelectorAll(".tab").forEach((tab) => tab.addEventListener("click", () => setTab(tab.dataset.tab)));
+      refs.reloadBtn.addEventListener("click", reload);
+      refs.saveBtn.addEventListener("click", save);
+      refs.applyRawBtn.addEventListener("click", applyRaw);
+      refs.rawEditor.addEventListener("input", () => { state.rawDirty = true; });
+      reload();
+
+      async function reload() {
+        setSaveState("正在同步控制面和配置快照…", "warn");
+        refs.reloadBtn.disabled = refs.saveBtn.disabled = true;
+        try {
+          const [status, config] = await Promise.all([json("/api/control/status"), json("/api/control/config")]);
+          state.status = status;
+          state.config = config;
+          state.draft = merge(config.defaults || {}, config.file_config || {});
+          syncRaw();
+          render();
+          setSaveState("已加载配置快照", "ok");
+        } catch (error) {
+          toast(String(error), "error");
+          setSaveState("读取失败", "danger");
+        } finally {
+          refs.reloadBtn.disabled = refs.saveBtn.disabled = false;
+        }
+      }
+
+      async function save() {
+        refs.saveBtn.disabled = true;
+        setSaveState("正在保存配置…", "warn");
+        try {
+          if (state.tab === "raw" && state.rawDirty) state.draft = JSON.parse(refs.rawEditor.value);
+          const response = await json("/api/control/config", {
+            method: "PUT", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ config: state.draft })
+          });
+          state.config = response.view;
+          state.rawDirty = false;
+          syncRaw();
+          renderMeta();
+          renderStatus();
+          renderGuided();
+          setSaveState("配置已保存", "ok");
+          toast(response.message || "配置已保存。", "ok");
+        } catch (error) {
+          setSaveState("保存失败", "danger");
+          toast(String(error), "error");
+        } finally {
+          refs.saveBtn.disabled = false;
+        }
+      }
+
+      function applyRaw() {
+        try {
+          state.draft = JSON.parse(refs.rawEditor.value);
+          state.rawDirty = false;
+          renderGuided();
+          toast("Raw JSON 已同步到 Guided 表单。", "ok");
+        } catch (error) {
+          toast("Raw JSON 解析失败: " + error.message, "error");
+        }
+      }
+
+      function render() { renderMeta(); renderStatus(); renderGuided(); }
+      function renderMeta() {
+        const snapshot = (state.status || {}).snapshot || {};
+        const config = state.config || {};
+        refs.configPath.textContent = config.path ? `${config.path}${config.exists ? "" : " (尚未创建)"}` : "未解析到配置路径";
+        refs.controlUrl.innerHTML = config.control_url ? `<a href="${esc(config.control_url)}" target="_blank" rel="noreferrer">${esc(config.control_url)}</a>` : "control UI 当前未启用";
+        refs.stats.innerHTML = [
+          stat("Ready", snapshot.ready ? "YES" : "NO"),
+          stat("Channels", String((snapshot.channels || []).length)),
+          stat("Transports", String((snapshot.transports || []).length)),
+          stat("Issues", String((snapshot.issues || []).length))
+        ].join("");
+      }
+
+      function renderStatus() {
+        const snapshot = (state.status || {}).snapshot || {};
+        const config = state.config || {};
+        const issues = snapshot.issues || [];
+        refs.readyState.className = `chip ${snapshot.ready ? "ok" : issues.length ? "danger" : "warn"}`;
+        refs.readyState.textContent = snapshot.ready ? "Ready" : issues.length ? "Needs Attention" : "Idle";
+
+        refs.warnings.innerHTML = (config.warnings && config.warnings.length)
+          ? config.warnings.map((text) => `<div class="notice">${esc(text)}</div>`).join("")
+          : `<div class="notice">当前没有额外警告。保存配置后，如果改动涉及 transport、model 或 memory provider，请重启 goclaw serve。</div>`;
+
+        refs.issues.innerHTML = issues.length
+          ? issues.map((text) => `<div class="issue">${esc(text)}</div>`).join("")
+          : `<div class="notice">Gateway 当前没有显式问题。</div>`;
+
+        refs.channels.innerHTML = (snapshot.channels || []).length
+          ? snapshot.channels.map((item) => row(
+              `${item.provider || "channel"}/${item.account_id || "default"}`,
+              `${item.state || "unknown"}${item.running ? " · running" : ""}`,
+              [item.profile_id && `profile=${item.profile_id}`, item.connection_mode && `mode=${item.connection_mode}`, item.runtime_id && `runtime=${item.runtime_id}`, item.last_error && `error=${item.last_error}`].filter(Boolean).join(" · ") || "no extra metadata"
+            )).join("")
+          : `<div class="empty">当前没有 channel snapshot。只开 control UI 也可以正常使用配置页。</div>`;
+
+        refs.transports.innerHTML = (snapshot.transports || []).length
+          ? snapshot.transports.map((item) => row(
+              item.name || "transport",
+              `${item.state || "idle"}${item.running ? " · running" : ""}`,
+              [item.source && `source=${item.source}`, item.kind && `kind=${item.kind}`, item.address && `address=${item.address}`, item.last_error && `error=${item.last_error}`].filter(Boolean).join(" · ") || "no extra metadata"
+            )).join("")
+          : `<div class="empty">当前没有 transport snapshot。可能还没有启用 webhook、longpoll 或 worker。</div>`;
+      }
+
+      function renderGuided() {
+        const fragment = [];
+        SECTIONS.forEach((section) => {
+          fragment.push(`<section class="card"><h3>${esc(section.title)}</h3><p>${esc(section.note || "")}</p><div class="fields">${section.fields.map(renderField).join("")}</div></section>`);
+        });
+        fragment.push(renderFeishuAccounts());
+        fragment.push(renderMCPServers());
+        refs.guided.innerHTML = fragment.join("");
+        bindFields();
+      }
+
+      function renderField(field) {
+        const value = get(state.draft, field.path);
+        if (field.type === "checkbox") {
+          return `<div class="field"><label>${esc(field.label)}</label><label class="toggle"><input data-path="${esc(field.path)}" data-type="${field.type}" type="checkbox" ${value ? "checked" : ""}><span>${value ? "Enabled" : "Disabled"}</span></label></div>`;
+        }
+        if (field.type === "select" || field.type === "tristate") {
+          const options = field.options.map((option) => {
+            const selected = String(valueForSelect(field, value)) === option.value ? "selected" : "";
+            return `<option value="${esc(option.value)}" ${selected}>${esc(option.label)}</option>`;
+          }).join("");
+          return `<div class="field"><label>${esc(field.label)}</label><select data-path="${esc(field.path)}" data-type="${field.type}">${options}</select></div>`;
+        }
+        return `<div class="field"><label>${esc(field.label)}</label><input data-path="${esc(field.path)}" data-type="${field.type}" type="${field.type === "password" ? "password" : field.type === "number" ? "number" : "text"}" value="${esc(value ?? (field.type === "number" ? 0 : ""))}"></div>`;
+      }
+
+      function renderFeishuAccounts() {
+        const accounts = get(state.draft, "channels.feishu.accounts") || {};
+        const cards = Object.entries(accounts).map(([id]) => {
+          const prefix = `channels.feishu.accounts.${id}`;
+          return `<article class="subcard">
+            <div class="toolbar"><div><h4>${esc(id)}</h4><p>常用 account 配置。更细的 action override 继续走 Raw JSON。</p></div><button class="ghost" data-remove-account="${esc(id)}" type="button">移除</button></div>
+            <div class="fields">
+              ${[
+                F(`${prefix}.name`,"Display Name"), T(`${prefix}.enabled`,"Enabled"), F(`${prefix}.profileId`,"Profile ID"),
+                S(`${prefix}.connectionMode`,"Connection Mode",[["longpoll","longpoll"],["webhook","webhook"]]),
+                S(`${prefix}.renderMode`,"Render Mode",[["auto","auto"],["card","card"],["raw","raw"]]),
+                F(`${prefix}.processingAckEmoji`,"Processing Ack Emoji"), F(`${prefix}.webhookHost`,"Webhook Host"), N(`${prefix}.webhookPort`,"Webhook Port"),
+                F(`${prefix}.webhookPath`,"Webhook Path"), F(`${prefix}.apiBaseUrl`,"API Base URL"), F(`${prefix}.appId`,"App ID"),
+                P(`${prefix}.appSecret`,"App Secret"), P(`${prefix}.encryptKey`,"Encrypt Key"), P(`${prefix}.verificationToken`,"Verification Token"), N(`${prefix}.maxBodyBytes`,"Max Body Bytes")
+              ].map(renderField).join("")}
+            </div></article>`;
+        }).join("");
+        return `<section class="card"><div class="toolbar"><div><h3>Feishu Accounts</h3><p>多账号入口和默认 webhook / longpoll 差异。</p></div><button class="secondary" id="addAccountBtn" type="button">新增 Account</button></div>${cards || '<div class="empty">还没有 account，点击右上角新增。</div>'}</section>`;
+      }
+
+      function renderMCPServers() {
+        const servers = get(state.draft, "mcp.servers") || {};
+        const cards = Object.entries(servers).map(([id]) => {
+          const prefix = `mcp.servers.${id}`;
+          return `<article class="subcard">
+            <div class="toolbar"><div><h4>${esc(id)}</h4><p>server 级配置。tool alias / safety override 继续走 Raw JSON。</p></div><button class="ghost" data-remove-server="${esc(id)}" type="button">移除</button></div>
+            <div class="fields">
+              ${[
+                T(`${prefix}.enabled`,"Enabled"), F(`${prefix}.command`,"Command"), C(`${prefix}.args`,"Args (comma separated)"),
+                F(`${prefix}.toolPrefix`,"Tool Prefix"), S(`${prefix}.safetyClass`,"Safety Class",[["read_only","read_only"],["trusted","trusted"],["dangerous","dangerous"]]),
+                N(`${prefix}.handshakeTimeoutSec`,"Handshake Timeout"), N(`${prefix}.callTimeoutSec`,"Call Timeout")
+              ].map(renderField).join("")}
+            </div></article>`;
+        }).join("");
+        return `<section class="card"><div class="toolbar"><div><h3>MCP Servers</h3><p>命令、参数、timeout 和 safety class。</p></div><button class="secondary" id="addServerBtn" type="button">新增 Server</button></div>${cards || '<div class="empty">当前没有 MCP server，点击右上角新增。</div>'}</section>`;
+      }
+
+      function bindFields() {
+        refs.guided.querySelectorAll("[data-path]").forEach((node) => node.addEventListener("change", () => {
+          const { path, type } = node.dataset;
+          if (type === "checkbox") set(state.draft, path, node.checked);
+          else if (type === "number") set(state.draft, path, Number(node.value || 0));
+          else if (type === "csv") set(state.draft, path, node.value.split(",").map((x) => x.trim()).filter(Boolean));
+          else if (type === "tristate") node.value === "inherit" ? unset(state.draft, path) : set(state.draft, path, node.value === "true");
+          else set(state.draft, path, node.value);
+          syncRaw();
+          if (type === "checkbox") node.nextElementSibling.textContent = node.checked ? "Enabled" : "Disabled";
+        }));
+        const addAccountBtn = $("addAccountBtn");
+        if (addAccountBtn) addAccountBtn.onclick = () => { const accounts = get(state.draft, "channels.feishu.accounts") || {}; const id = nextKey(accounts, "account"); accounts[id] = { profileId: id, renderMode: "auto", connectionMode: "longpoll" }; set(state.draft, "channels.feishu.accounts", accounts); syncRaw(); renderGuided(); };
+        const addServerBtn = $("addServerBtn");
+        if (addServerBtn) addServerBtn.onclick = () => { const servers = get(state.draft, "mcp.servers") || {}; const id = nextKey(servers, "server"); servers[id] = { command: "", args: [], safetyClass: "read_only", toolPrefix: id, handshakeTimeoutSec: 10, callTimeoutSec: 20 }; set(state.draft, "mcp.servers", servers); syncRaw(); renderGuided(); };
+        refs.guided.querySelectorAll("[data-remove-account]").forEach((button) => button.onclick = () => { const accounts = get(state.draft, "channels.feishu.accounts") || {}; delete accounts[button.dataset.removeAccount]; set(state.draft, "channels.feishu.accounts", accounts); syncRaw(); renderGuided(); });
+        refs.guided.querySelectorAll("[data-remove-server]").forEach((button) => button.onclick = () => { const servers = get(state.draft, "mcp.servers") || {}; delete servers[button.dataset.removeServer]; set(state.draft, "mcp.servers", servers); syncRaw(); renderGuided(); });
+      }
+
+      function syncRaw() { refs.rawEditor.value = JSON.stringify(state.draft, null, 2); state.rawDirty = false; }
+      function setTab(tab) {
+        state.tab = tab;
+        document.querySelectorAll(".tab").forEach((item) => item.classList.toggle("active", item.dataset.tab === tab));
+        document.querySelectorAll(".panel-tab").forEach((item) => item.classList.toggle("active", item.dataset.panel === tab));
+      }
+
+      async function json(url, options) {
+        const response = await fetch(url, options);
+        const data = await response.json().catch(() => null);
+        if (!response.ok) throw new Error(data && data.error ? data.error : `${response.status} ${response.statusText}`);
+        return data;
+      }
+      function setSaveState(text, tone) { refs.saveState.textContent = text; refs.saveState.className = `chip ${tone === "ok" ? "ok" : tone === "danger" ? "danger" : "warn"}`; }
+      function stat(label, value) { return `<div class="stat"><span>${esc(label)}</span><strong>${esc(value)}</strong></div>`; }
+      function row(title, stateText, meta) { return `<div class="row"><strong>${esc(title)}</strong><span>${esc(stateText)}</span><code>${esc(meta)}</code></div>`; }
+      function toast(text, tone) { refs.toast.textContent = text; refs.toast.className = `toast ${tone === "error" ? "error" : "ok"} show`; clearTimeout(toast.timer); toast.timer = setTimeout(() => { refs.toast.className = `toast ${tone === "error" ? "error" : "ok"}`; }, 3200); }
+      function merge(base, over) {
+        if (Array.isArray(base)) return Array.isArray(over) ? clone(over) : clone(base);
+        if (!obj(base)) return over === undefined ? clone(base) : clone(over);
+        const out = {}; new Set([...Object.keys(base || {}), ...Object.keys(over || {})]).forEach((key) => {
+          const a = base ? base[key] : undefined, b = over ? over[key] : undefined;
+          out[key] = b === undefined ? clone(a) : obj(a) && obj(b) ? merge(a, b) : clone(b);
+        }); return out;
+      }
+      function get(root, path) { return path.split(".").reduce((cur, seg) => cur && cur[seg], root); }
+      function set(root, path, value) { const parts = path.split("."); let cur = root; parts.forEach((seg, idx) => { if (idx === parts.length - 1) cur[seg] = value; else { if (!obj(cur[seg])) cur[seg] = {}; cur = cur[seg]; } }); }
+      function unset(root, path) { const parts = path.split("."); let cur = root; for (let i = 0; i < parts.length - 1; i += 1) { if (!obj(cur[parts[i]])) return; cur = cur[parts[i]]; } delete cur[parts[parts.length - 1]]; }
+      function clone(value) { return value === undefined ? undefined : JSON.parse(JSON.stringify(value)); }
+      function nextKey(record, prefix) { let i = 1, key = prefix; while (record[key]) { i += 1; key = `${prefix}${i}`; } return key; }
+      function obj(value) { return value && typeof value === "object" && !Array.isArray(value); }
+      function valueForSelect(field, value) { return field.type === "tristate" ? (value === undefined ? "inherit" : String(Boolean(value))) : (value ?? ""); }
+      function esc(value) { return String(value ?? "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;").replaceAll('"',"&quot;").replaceAll("'","&#39;"); }
+      function F(path, label) { return { path, label, type: "text" }; }
+      function P(path, label) { return { path, label, type: "password" }; }
+      function N(path, label) { return { path, label, type: "number" }; }
+      function B(path, label) { return { path, label, type: "checkbox" }; }
+      function C(path, label) { return { path, label, type: "csv" }; }
+      function T(path, label) { return { path, label, type: "tristate", options: [{ value: "inherit", label: "inherit" }, { value: "true", label: "enabled" }, { value: "false", label: "disabled" }] }; }
+      function S(path, label, options) { return { path, label, type: "select", options: options.map(([value, text]) => ({ value, label: text })) }; }
+    </script>
+  </body>
+</html>

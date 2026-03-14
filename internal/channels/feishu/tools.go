@@ -977,7 +977,11 @@ func (p toolProvider) messageUpdateTool(account Account) agenttools.Definition {
 			if err != nil {
 				return nil, providerError("feishu_message_update", "resolve feishu client", err)
 			}
-			if err := client.UpdateMessageContent(ctx, messageID, contentJSON); err != nil {
+			if err := client.UpdateMessage(ctx, rawfeishu.UpdateMessageRequest{
+				MessageID:   messageID,
+				MsgType:     "text",
+				ContentJSON: contentJSON,
+			}); err != nil {
 				return nil, normalizeFeishuToolError("feishu_message_update", "feishu.im.message.update", err)
 			}
 			return map[string]any{

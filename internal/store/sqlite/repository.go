@@ -405,19 +405,38 @@ func (r ToolPermissionPoliciesRepository) Upsert(
 	if err != nil {
 		return fmt.Errorf("encode denied channel providers: %w", err)
 	}
+	allowedMCPTools, err := encodeStringList(policy.AllowedMCPTools)
+	if err != nil {
+		return fmt.Errorf("encode allowed mcp tools: %w", err)
+	}
+	deniedMCPTools, err := encodeStringList(policy.DeniedMCPTools)
+	if err != nil {
+		return fmt.Errorf("encode denied mcp tools: %w", err)
+	}
+	allowedMCPServers, err := encodeStringList(policy.AllowedMCPServers)
+	if err != nil {
+		return fmt.Errorf("encode allowed mcp servers: %w", err)
+	}
+	deniedMCPServers, err := encodeStringList(policy.DeniedMCPServers)
+	if err != nil {
+		return fmt.Errorf("encode denied mcp servers: %w", err)
+	}
 
 	_, err = r.db.ExecContext(
 		ctx,
 		`INSERT INTO tool_permission_policies(
 		   id, profile_id, room_id, commands_mode, paths_mode, network_mode,
 		   channel_introspection_mode, channel_read_mode, channel_write_mode, channel_sensitive_mode,
+		   mcp_introspection_mode, mcp_read_mode, mcp_write_mode, mcp_sensitive_mode,
 		   allowed_commands_json, denied_commands_json, allowed_paths_json, denied_paths_json,
 		   allowed_hosts_json, denied_hosts_json,
 		   allowed_channel_tools_json, denied_channel_tools_json,
 		   allowed_channel_providers_json, denied_channel_providers_json,
+		   allowed_mcp_tools_json, denied_mcp_tools_json,
+		   allowed_mcp_servers_json, denied_mcp_servers_json,
 		   updated_by, created_at, updated_at
 		 )
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(profile_id, room_id) DO UPDATE SET
 		   commands_mode = excluded.commands_mode,
 		   paths_mode = excluded.paths_mode,
@@ -426,6 +445,10 @@ func (r ToolPermissionPoliciesRepository) Upsert(
 		   channel_read_mode = excluded.channel_read_mode,
 		   channel_write_mode = excluded.channel_write_mode,
 		   channel_sensitive_mode = excluded.channel_sensitive_mode,
+		   mcp_introspection_mode = excluded.mcp_introspection_mode,
+		   mcp_read_mode = excluded.mcp_read_mode,
+		   mcp_write_mode = excluded.mcp_write_mode,
+		   mcp_sensitive_mode = excluded.mcp_sensitive_mode,
 		   allowed_commands_json = excluded.allowed_commands_json,
 		   denied_commands_json = excluded.denied_commands_json,
 		   allowed_paths_json = excluded.allowed_paths_json,
@@ -436,6 +459,10 @@ func (r ToolPermissionPoliciesRepository) Upsert(
 		   denied_channel_tools_json = excluded.denied_channel_tools_json,
 		   allowed_channel_providers_json = excluded.allowed_channel_providers_json,
 		   denied_channel_providers_json = excluded.denied_channel_providers_json,
+		   allowed_mcp_tools_json = excluded.allowed_mcp_tools_json,
+		   denied_mcp_tools_json = excluded.denied_mcp_tools_json,
+		   allowed_mcp_servers_json = excluded.allowed_mcp_servers_json,
+		   denied_mcp_servers_json = excluded.denied_mcp_servers_json,
 		   updated_by = excluded.updated_by,
 		   updated_at = excluded.updated_at;`,
 		buildToolPermissionPolicyID(policy.ProfileID, policy.RoomID),
@@ -448,6 +475,10 @@ func (r ToolPermissionPoliciesRepository) Upsert(
 		string(normalizeToolPermissionMode(policy.ChannelReadMode)),
 		string(normalizeToolPermissionMode(policy.ChannelWriteMode)),
 		string(normalizeToolPermissionMode(policy.ChannelSensitiveMode)),
+		string(normalizeToolPermissionMode(policy.MCPIntrospectionMode)),
+		string(normalizeToolPermissionMode(policy.MCPReadMode)),
+		string(normalizeToolPermissionMode(policy.MCPWriteMode)),
+		string(normalizeToolPermissionMode(policy.MCPSensitiveMode)),
 		allowedCommands,
 		deniedCommands,
 		allowedPaths,
@@ -458,6 +489,10 @@ func (r ToolPermissionPoliciesRepository) Upsert(
 		deniedChannelTools,
 		allowedChannelProviders,
 		deniedChannelProviders,
+		allowedMCPTools,
+		deniedMCPTools,
+		allowedMCPServers,
+		deniedMCPServers,
 		normalizeToolPermissionUpdatedBy(policy.UpdatedBy),
 		now,
 		now,
@@ -478,10 +513,13 @@ func (r ToolPermissionPoliciesRepository) Get(
 			ctx,
 			`SELECT profile_id, room_id, commands_mode, paths_mode, network_mode,
 			        channel_introspection_mode, channel_read_mode, channel_write_mode, channel_sensitive_mode,
+			        mcp_introspection_mode, mcp_read_mode, mcp_write_mode, mcp_sensitive_mode,
 			        allowed_commands_json, denied_commands_json, allowed_paths_json, denied_paths_json,
 			        allowed_hosts_json, denied_hosts_json,
 			        allowed_channel_tools_json, denied_channel_tools_json,
 			        allowed_channel_providers_json, denied_channel_providers_json,
+			        allowed_mcp_tools_json, denied_mcp_tools_json,
+			        allowed_mcp_servers_json, denied_mcp_servers_json,
 			        updated_by, created_at, updated_at
 			 FROM tool_permission_policies
 			 WHERE profile_id = ? AND room_id = ?;`,
@@ -1100,6 +1138,10 @@ func scanToolPermissionPolicy(row *sql.Row) (domain.ToolPermissionPolicy, error)
 		deniedChannelToolsJSON      string
 		allowedChannelProvidersJSON string
 		deniedChannelProvidersJSON  string
+		allowedMCPToolsJSON         string
+		deniedMCPToolsJSON          string
+		allowedMCPServersJSON       string
+		deniedMCPServersJSON        string
 		createdAtText               string
 		updatedAtText               string
 	)
@@ -1113,6 +1155,10 @@ func scanToolPermissionPolicy(row *sql.Row) (domain.ToolPermissionPolicy, error)
 		&policy.ChannelReadMode,
 		&policy.ChannelWriteMode,
 		&policy.ChannelSensitiveMode,
+		&policy.MCPIntrospectionMode,
+		&policy.MCPReadMode,
+		&policy.MCPWriteMode,
+		&policy.MCPSensitiveMode,
 		&allowedCommandsJSON,
 		&deniedCommandsJSON,
 		&allowedPathsJSON,
@@ -1123,6 +1169,10 @@ func scanToolPermissionPolicy(row *sql.Row) (domain.ToolPermissionPolicy, error)
 		&deniedChannelToolsJSON,
 		&allowedChannelProvidersJSON,
 		&deniedChannelProvidersJSON,
+		&allowedMCPToolsJSON,
+		&deniedMCPToolsJSON,
+		&allowedMCPServersJSON,
+		&deniedMCPServersJSON,
 		&policy.UpdatedBy,
 		&createdAtText,
 		&updatedAtText,
@@ -1138,6 +1188,10 @@ func scanToolPermissionPolicy(row *sql.Row) (domain.ToolPermissionPolicy, error)
 	policy.ChannelReadMode = normalizeToolPermissionMode(policy.ChannelReadMode)
 	policy.ChannelWriteMode = normalizeToolPermissionMode(policy.ChannelWriteMode)
 	policy.ChannelSensitiveMode = normalizeToolPermissionMode(policy.ChannelSensitiveMode)
+	policy.MCPIntrospectionMode = normalizeToolPermissionMode(policy.MCPIntrospectionMode)
+	policy.MCPReadMode = normalizeToolPermissionMode(policy.MCPReadMode)
+	policy.MCPWriteMode = normalizeToolPermissionMode(policy.MCPWriteMode)
+	policy.MCPSensitiveMode = normalizeToolPermissionMode(policy.MCPSensitiveMode)
 
 	policy.AllowedCommands, err = decodeStringList(allowedCommandsJSON)
 	if err != nil {
@@ -1178,6 +1232,22 @@ func scanToolPermissionPolicy(row *sql.Row) (domain.ToolPermissionPolicy, error)
 	policy.DeniedChannelProviders, err = decodeStringList(deniedChannelProvidersJSON)
 	if err != nil {
 		return domain.ToolPermissionPolicy{}, fmt.Errorf("decode denied channel providers: %w", err)
+	}
+	policy.AllowedMCPTools, err = decodeStringList(allowedMCPToolsJSON)
+	if err != nil {
+		return domain.ToolPermissionPolicy{}, fmt.Errorf("decode allowed mcp tools: %w", err)
+	}
+	policy.DeniedMCPTools, err = decodeStringList(deniedMCPToolsJSON)
+	if err != nil {
+		return domain.ToolPermissionPolicy{}, fmt.Errorf("decode denied mcp tools: %w", err)
+	}
+	policy.AllowedMCPServers, err = decodeStringList(allowedMCPServersJSON)
+	if err != nil {
+		return domain.ToolPermissionPolicy{}, fmt.Errorf("decode allowed mcp servers: %w", err)
+	}
+	policy.DeniedMCPServers, err = decodeStringList(deniedMCPServersJSON)
+	if err != nil {
+		return domain.ToolPermissionPolicy{}, fmt.Errorf("decode denied mcp servers: %w", err)
 	}
 
 	createdAt, err := parseTime(createdAtText)
@@ -1331,6 +1401,10 @@ func defaultToolPermissionPolicy(
 		ChannelReadMode:          domain.ToolPermissionDenyAll,
 		ChannelWriteMode:         domain.ToolPermissionDenyAll,
 		ChannelSensitiveMode:     domain.ToolPermissionDenyAll,
+		MCPIntrospectionMode:     domain.ToolPermissionDenyAll,
+		MCPReadMode:              domain.ToolPermissionDenyAll,
+		MCPWriteMode:             domain.ToolPermissionDenyAll,
+		MCPSensitiveMode:         domain.ToolPermissionDenyAll,
 		AllowedChannelProviders:  []string{string(provider)},
 	}
 }

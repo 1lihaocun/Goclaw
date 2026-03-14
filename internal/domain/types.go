@@ -251,6 +251,10 @@ type ToolPermissionPolicy struct {
 	ChannelReadMode          ToolPermissionMode
 	ChannelWriteMode         ToolPermissionMode
 	ChannelSensitiveMode     ToolPermissionMode
+	MCPIntrospectionMode     ToolPermissionMode
+	MCPReadMode              ToolPermissionMode
+	MCPWriteMode             ToolPermissionMode
+	MCPSensitiveMode         ToolPermissionMode
 	AllowedCommands          []string
 	DeniedCommands           []string
 	AllowedPaths             []string
@@ -261,6 +265,10 @@ type ToolPermissionPolicy struct {
 	DeniedChannelTools       []string
 	AllowedChannelProviders  []string
 	DeniedChannelProviders   []string
+	AllowedMCPTools          []string
+	DeniedMCPTools           []string
+	AllowedMCPServers        []string
+	DeniedMCPServers         []string
 	Explicit                 bool
 	UpdatedBy                string
 	CreatedAt                time.Time

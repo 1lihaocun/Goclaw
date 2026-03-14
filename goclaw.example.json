@@ -2,6 +2,9 @@
   "database": {
     "path": "var/goclaw.db"
   },
+  "workspace": {
+    "root": "var/workspace"
+  },
   "channels": {
     "feishu": {
       "enabled": true,
@@ -22,7 +25,7 @@
       "accounts": {
         "main": {
           "profileId": "main",
-          "renderMode": "card",
+          "renderMode": "auto",
           "processingAckEmoji": "DONE",
           "actions": {
             "processingAck": false
@@ -36,5 +39,32 @@
     "api": "openai-completions",
     "baseUrl": "https://api.openai.com/v1",
     "modelId": "gpt-4.1-mini"
+  },
+  "tooling": {
+    "legacyJsonFallbackEnabled": false,
+    "maxIterations": 6
+  },
+  "mcp": {
+    "enabled": true,
+    "servers": {
+      "github": {
+        "command": "github-mcp-server",
+        "args": [
+          "stdio"
+        ],
+        "safetyClass": "read_only",
+        "toolPrefix": "github",
+        "handshakeTimeoutSec": 10,
+        "callTimeoutSec": 20
+      }
+    }
+  },
+  "skills": {
+    "enabled": true,
+    "root": "var/workspace/skills",
+    "maxEntries": 32,
+    "maxInline": 4,
+    "maxBytesPerSkill": 4000,
+    "maxPromptBytes": 16000
   }
 }

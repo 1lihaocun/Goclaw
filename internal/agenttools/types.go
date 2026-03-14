@@ -16,6 +16,7 @@ type Source string
 const (
 	SourceLocal   Source = "local"
 	SourceChannel Source = "channel"
+	SourceMCP     Source = "mcp"
 )
 
 type SafetyClass string

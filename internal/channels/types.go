@@ -63,11 +63,32 @@ type ProcessingAckHandle struct {
 	AckID     string
 }
 
+type StreamingReplyTarget struct {
+	RoomID           string
+	ReplyToMessageID string
+}
+
 type Outbound interface {
 	ProfileID() domain.ProfileID
 	Provider() domain.Provider
 	Configured() bool
 	SendText(ctx context.Context, roomID, text string) (SendResult, error)
+}
+
+type StreamingReplySession interface {
+	SendResult() SendResult
+	UpdateText(ctx context.Context, text string) error
+	Close(ctx context.Context, finalText string) error
+}
+
+type ToolStreamingReplySession interface {
+	StreamingReplySession
+	UpdateToolMessage(ctx context.Context, toolCallID, text string, allowEdit bool) error
+}
+
+type StreamingReplyOutbound interface {
+	Outbound
+	BeginStreamingReply(ctx context.Context, target StreamingReplyTarget) (StreamingReplySession, error)
 }
 
 type ProcessingAckOutbound interface {
@@ -85,9 +106,99 @@ type ChannelEventObserver interface {
 }
 
 type BuildRuntimeParams struct {
-	Logger        *slog.Logger
-	Ingestor      InboundMessageIngestor
-	EventObserver ChannelEventObserver
+	Logger                 *slog.Logger
+	Ingestor               InboundMessageIngestor
+	EventObserver          ChannelEventObserver
+	RootContext            context.Context
+	ManagedRuntimePolicy   ManagedRuntimePolicy
+	ManagedRuntimeObserver ManagedRuntimeObserver
+}
+
+type ManagedRuntimePolicy struct {
+	Enabled        bool
+	MaxAttempts    int
+	InitialBackoff time.Duration
+	MaxBackoff     time.Duration
+}
+
+type ManagedRuntimeObserver interface {
+	MarkRuntimeStarting(runtimeID string, now time.Time)
+	MarkRuntimeBackingOff(runtimeID string, now time.Time, nextRetryAt time.Time, err error)
+	MarkRuntimeStopped(runtimeID string, now time.Time, err error)
+	ReportRuntimeFailure(runtimeID string, err error)
+}
+
+type AccountSnapshot struct {
+	Provider        domain.Provider  `json:"provider"`
+	AccountID       string           `json:"account_id"`
+	Name            string           `json:"name,omitempty"`
+	ProfileID       domain.ProfileID `json:"profile_id"`
+	Enabled         bool             `json:"enabled"`
+	Configured      bool             `json:"configured"`
+	ConnectionMode  string           `json:"connection_mode,omitempty"`
+	TransportID     string           `json:"transport_id,omitempty"`
+	RuntimeID       string           `json:"runtime_id,omitempty"`
+	WebhookAddress  string           `json:"webhook_address,omitempty"`
+	WebhookPath     string           `json:"webhook_path,omitempty"`
+	BackgroundOnly  bool             `json:"background_only,omitempty"`
+	SupportsIngress bool             `json:"supports_ingress,omitempty"`
+}
+
+type TransportRuntimeKind string
+
+const (
+	TransportRuntimeKindWebhook  TransportRuntimeKind = "webhook"
+	TransportRuntimeKindLongpoll TransportRuntimeKind = "longpoll"
+)
+
+type TransportLifecycleMode string
+
+const (
+	TransportLifecycleModeSharedRuntime    TransportLifecycleMode = "shared_runtime"
+	TransportLifecycleModeDedicatedRuntime TransportLifecycleMode = "dedicated_runtime"
+)
+
+type AccountRef struct {
+	Provider  domain.Provider  `json:"provider"`
+	AccountID string           `json:"account_id"`
+	ProfileID domain.ProfileID `json:"profile_id"`
+}
+
+type TransportBinding struct {
+	AccountID      string           `json:"account_id"`
+	ProfileID      domain.ProfileID `json:"profile_id"`
+	TransportID    string           `json:"transport_id"`
+	ConnectionMode string           `json:"connection_mode"`
+	WebhookPath    string           `json:"webhook_path,omitempty"`
+	Configured     bool             `json:"configured"`
+}
+
+type TransportSnapshot struct {
+	Provider        domain.Provider        `json:"provider"`
+	Name            string                 `json:"name"`
+	RuntimeID       string                 `json:"runtime_id"`
+	Kind            TransportRuntimeKind   `json:"kind"`
+	LifecycleMode   TransportLifecycleMode `json:"lifecycle_mode"`
+	OperatorManaged bool                   `json:"operator_managed"`
+	Shared          bool                   `json:"shared"`
+	Address         string                 `json:"address,omitempty"`
+	Bindings        []TransportBinding     `json:"bindings,omitempty"`
+}
+
+type AccountLifecycleSpec struct {
+	Provider        domain.Provider        `json:"provider"`
+	AccountID       string                 `json:"account_id"`
+	ProfileID       domain.ProfileID       `json:"profile_id"`
+	Enabled         bool                   `json:"enabled"`
+	Configured      bool                   `json:"configured"`
+	RuntimeID       string                 `json:"runtime_id,omitempty"`
+	ConnectionMode  string                 `json:"connection_mode,omitempty"`
+	LifecycleMode   TransportLifecycleMode `json:"lifecycle_mode,omitempty"`
+	OperatorManaged bool                   `json:"operator_managed"`
+	SupportsStart   bool                   `json:"supports_start"`
+	SupportsStop    bool                   `json:"supports_stop"`
+	SupportsRestart bool                   `json:"supports_restart"`
+	Reason          string                 `json:"reason,omitempty"`
 }
 
 type ToolBuildParams struct {
@@ -114,4 +225,26 @@ type Channel interface {
 	HTTPRoutes(params BuildRuntimeParams) ([]HTTPRoute, error)
 	Transports(params BuildRuntimeParams) ([]Transport, error)
 	AgentToolProviders(params ToolBuildParams) ([]agenttools.Provider, error)
+}
+
+type AccountSnapshotReporter interface {
+	AccountSnapshots() []AccountSnapshot
+}
+
+type TransportSnapshotReporter interface {
+	TransportSnapshots() []TransportSnapshot
+}
+
+type AccountLifecycleSpecReporter interface {
+	AccountLifecycleSpecs() []AccountLifecycleSpec
+}
+
+type AccountLifecycleController interface {
+	StartAccount(ctx context.Context, account AccountRef) error
+	StopAccount(ctx context.Context, account AccountRef) error
+	RestartAccount(ctx context.Context, account AccountRef) error
+}
+
+type RuntimeBinder interface {
+	BindRuntime(params BuildRuntimeParams)
 }

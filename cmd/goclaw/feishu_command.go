@@ -408,10 +408,12 @@ func runFeishuMessageCommand(ctx context.Context, app *runtime.App, args []strin
 
 		var profileID string
 		var messageID string
+		var msgType string
 		var contentJSON string
 		var text string
 		fs.StringVar(&profileID, "profile-id", "", "profile id")
 		fs.StringVar(&messageID, "message-id", "", "message id")
+		fs.StringVar(&msgType, "msg-type", "text", "message type")
 		fs.StringVar(&contentJSON, "content-json", "", "message content json")
 		fs.StringVar(&text, "text", "", "text content convenience wrapper")
 
@@ -430,7 +432,12 @@ func runFeishuMessageCommand(ctx context.Context, app *runtime.App, args []strin
 		if strings.TrimSpace(contentJSON) != "" && strings.TrimSpace(text) != "" {
 			return errors.New("--content-json and --text cannot be used together")
 		}
+		msgType = strings.TrimSpace(strings.ToLower(msgType))
 		if strings.TrimSpace(text) != "" {
+			if msgType != "" && msgType != "text" {
+				return errors.New("--text can only be used with --msg-type text")
+			}
+			msgType = "text"
 			contentJSON = rawfeishu.TextContentJSON(text)
 		}
 
@@ -438,7 +445,11 @@ func runFeishuMessageCommand(ctx context.Context, app *runtime.App, args []strin
 		if err != nil {
 			return err
 		}
-		if err := client.UpdateMessageContent(ctx, messageID, contentJSON); err != nil {
+		if err := client.UpdateMessage(ctx, rawfeishu.UpdateMessageRequest{
+			MessageID:   strings.TrimSpace(messageID),
+			MsgType:     msgType,
+			ContentJSON: strings.TrimSpace(contentJSON),
+		}); err != nil {
 			return decorateFeishuError(err)
 		}
 		return writeJSON(stdout, map[string]string{

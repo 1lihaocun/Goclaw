@@ -58,6 +58,12 @@ type ReplyMessageRequest struct {
 	UUID          string
 }
 
+type UpdateMessageRequest struct {
+	MessageID   string
+	MsgType     string
+	ContentJSON string
+}
+
 type ForwardMessageRequest struct {
 	MessageID     string
 	ReceiveIDType string
@@ -544,9 +550,10 @@ func (c *Client) ListChatMembers(
 	}, nil
 }
 
-func (c *Client) UpdateMessageContent(ctx context.Context, messageID, contentJSON string) error {
-	body, err := c.callJSON(ctx, http.MethodPatch, "/im/v1/messages/"+url.PathEscape(strings.TrimSpace(messageID)), map[string]string{
-		"content": strings.TrimSpace(contentJSON),
+func (c *Client) UpdateMessage(ctx context.Context, req UpdateMessageRequest) error {
+	body, err := c.callJSON(ctx, http.MethodPut, "/im/v1/messages/"+url.PathEscape(strings.TrimSpace(req.MessageID)), map[string]string{
+		"msg_type": normalizeEditableMessageType(req.MsgType),
+		"content":  strings.TrimSpace(req.ContentJSON),
 	})
 	if err != nil {
 		return err
@@ -563,6 +570,15 @@ func (c *Client) UpdateMessageContent(ctx context.Context, messageID, contentJSO
 		return newAPIError("feishu update message failed", response.Code, response.Msg, body)
 	}
 	return nil
+}
+
+func normalizeEditableMessageType(msgType string) string {
+	switch strings.ToLower(strings.TrimSpace(msgType)) {
+	case "post":
+		return "post"
+	default:
+		return "text"
+	}
 }
 
 func (c *Client) RecallMessage(ctx context.Context, messageID string) error {

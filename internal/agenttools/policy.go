@@ -40,6 +40,34 @@ func AllowsChannelTool(
 	}
 }
 
+func AllowsMCPTool(policy domain.ToolPermissionPolicy, definition Definition) bool {
+	if definition.Source != SourceMCP {
+		return false
+	}
+	serverName := strings.TrimSpace(string(definition.Provider))
+	if serverName == "" {
+		return false
+	}
+
+	if listContains(policy.DeniedMCPTools, definition.Name) {
+		return false
+	}
+	if listContains(policy.DeniedMCPServers, serverName) {
+		return false
+	}
+
+	mode := mcpModeForSafety(policy, definition.SafetyClass)
+	switch mode {
+	case domain.ToolPermissionAllowAll:
+		return true
+	case domain.ToolPermissionAllowList:
+		return listContains(policy.AllowedMCPTools, definition.Name) ||
+			listContains(policy.AllowedMCPServers, serverName)
+	default:
+		return false
+	}
+}
+
 func channelModeForSafety(
 	policy domain.ToolPermissionPolicy,
 	safety SafetyClass,
@@ -53,6 +81,24 @@ func channelModeForSafety(
 		return normalizeMode(policy.ChannelWriteMode)
 	case SafetySensitive:
 		return normalizeMode(policy.ChannelSensitiveMode)
+	default:
+		return domain.ToolPermissionDenyAll
+	}
+}
+
+func mcpModeForSafety(
+	policy domain.ToolPermissionPolicy,
+	safety SafetyClass,
+) domain.ToolPermissionMode {
+	switch safety {
+	case SafetyIntrospection:
+		return normalizeMode(policy.MCPIntrospectionMode)
+	case SafetyReadOnly:
+		return normalizeMode(policy.MCPReadMode)
+	case SafetyMutating:
+		return normalizeMode(policy.MCPWriteMode)
+	case SafetySensitive:
+		return normalizeMode(policy.MCPSensitiveMode)
 	default:
 		return domain.ToolPermissionDenyAll
 	}

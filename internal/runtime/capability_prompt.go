@@ -20,6 +20,7 @@ const (
 type capabilitySnapshot struct {
 	Channel      channelCapabilitySnapshot
 	Tooling      toolingSnapshot
+	Skills       skillsCapabilitySnapshot
 	Memory       memoryCapabilitySnapshot
 	Conversation conversationCapabilitySnapshot
 	Runtime      runtimeCapabilitySnapshot
@@ -60,6 +61,17 @@ type toolPolicySnapshot struct {
 	ChannelReadMode          domain.ToolPermissionMode
 	ChannelWriteMode         domain.ToolPermissionMode
 	ChannelSensitiveMode     domain.ToolPermissionMode
+	MCPIntrospectionMode     domain.ToolPermissionMode
+	MCPReadMode              domain.ToolPermissionMode
+	MCPWriteMode             domain.ToolPermissionMode
+	MCPSensitiveMode         domain.ToolPermissionMode
+}
+
+type skillsCapabilitySnapshot struct {
+	Mode          string
+	Available     int
+	Inline        int
+	VisibleSkills []string
 }
 
 type memoryCapabilitySnapshot struct {
@@ -81,6 +93,7 @@ type conversationCapabilitySnapshot struct {
 type runtimeCapabilitySnapshot struct {
 	FinalOnlyDelivery bool
 	WorkspaceRoot     string
+	SkillsRoot        string
 }
 
 func buildCapabilitySnapshot(
@@ -128,6 +141,12 @@ func buildCapabilitySnapshot(
 			Policy:       summarizeToolPolicy(policy),
 			VisibleTools: visibleTools,
 		},
+		Skills: skillsCapabilitySnapshot{
+			Mode:          skillModeLabel(promptPackage),
+			Available:     len(promptPackage.Skills.AllSkills),
+			Inline:        len(promptPackage.Skills.InlineSkills),
+			VisibleSkills: skillNames(promptPackage.Skills.AllSkills),
+		},
 		Memory: memoryCapabilitySnapshot{
 			MarkdownEnabled: markdownEnabled,
 			ProviderEnabled: providerEnabled,
@@ -145,6 +164,7 @@ func buildCapabilitySnapshot(
 		Runtime: runtimeCapabilitySnapshot{
 			FinalOnlyDelivery: true,
 			WorkspaceRoot:     capabilityWorkspaceRoot(promptBuilder),
+			SkillsRoot:        capabilitySkillsRoot(promptBuilder),
 		},
 	}
 }
@@ -155,6 +175,7 @@ func appendCapabilityPrompt(system string, snapshot capabilitySnapshot) string {
 		renderChannelGuidanceSection(snapshot.Channel),
 		renderToolingSection(snapshot.Tooling),
 		renderToolCallStyleSection(snapshot.Tooling),
+		renderSkillsCapabilitySection(snapshot.Skills),
 		renderMemoryCapabilitySection(snapshot.Memory),
 		renderRuntimeLimitsSection(snapshot),
 	}
@@ -188,6 +209,7 @@ func renderCapabilityOverview(snapshot capabilitySnapshot) string {
 	}
 	lines = append(lines,
 		fmt.Sprintf("tools=%s", snapshot.Tooling.Mode),
+		fmt.Sprintf("skills=%s", snapshot.Skills.Mode),
 		fmt.Sprintf("memory=%s", memoryMode),
 		fmt.Sprintf("personal_memory_access=%s", snapshot.Memory.ConsentLevel),
 		"delivery=final_only",
@@ -248,6 +270,13 @@ func renderToolingSection(snapshot toolingSnapshot) string {
 			snapshot.Policy.ChannelWriteMode,
 			snapshot.Policy.ChannelSensitiveMode,
 		),
+		fmt.Sprintf(
+			"mcp_policy=introspection:%s,read:%s,write:%s,sensitive:%s",
+			snapshot.Policy.MCPIntrospectionMode,
+			snapshot.Policy.MCPReadMode,
+			snapshot.Policy.MCPWriteMode,
+			snapshot.Policy.MCPSensitiveMode,
+		),
 	}
 	if len(snapshot.VisibleTools) == 0 {
 		lines = append(lines, "No room-visible tools are currently exposed.")
@@ -307,6 +336,23 @@ func renderMemoryCapabilitySection(snapshot memoryCapabilitySnapshot) string {
 	}, "\n")
 }
 
+func renderSkillsCapabilitySection(snapshot skillsCapabilitySnapshot) string {
+	if snapshot.Mode == "disabled" {
+		return ""
+	}
+	lines := []string{
+		"[Skill Capabilities]",
+		fmt.Sprintf("mode=%s", snapshot.Mode),
+		fmt.Sprintf("available=%d", snapshot.Available),
+		fmt.Sprintf("inline=%d", snapshot.Inline),
+		"skills_are_prompt_guidance_only=true",
+	}
+	if len(snapshot.VisibleSkills) > 0 {
+		lines = append(lines, "skill_names="+strings.Join(snapshot.VisibleSkills, ","))
+	}
+	return strings.Join(lines, "\n")
+}
+
 func renderRuntimeLimitsSection(snapshot capabilitySnapshot) string {
 	lines := []string{
 		"[Runtime Limits]",
@@ -316,6 +362,9 @@ func renderRuntimeLimitsSection(snapshot capabilitySnapshot) string {
 	}
 	if strings.TrimSpace(snapshot.Runtime.WorkspaceRoot) != "" {
 		lines = append(lines, fmt.Sprintf("workspace_root=%s", snapshot.Runtime.WorkspaceRoot))
+	}
+	if strings.TrimSpace(snapshot.Runtime.SkillsRoot) != "" {
+		lines = append(lines, fmt.Sprintf("skills_root=%s", snapshot.Runtime.SkillsRoot))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -347,6 +396,10 @@ func summarizeToolPolicy(policy domain.ToolPermissionPolicy) toolPolicySnapshot 
 		ChannelReadMode:          normalizeToolPermissionMode(policy.ChannelReadMode),
 		ChannelWriteMode:         normalizeToolPermissionMode(policy.ChannelWriteMode),
 		ChannelSensitiveMode:     normalizeToolPermissionMode(policy.ChannelSensitiveMode),
+		MCPIntrospectionMode:     normalizeToolPermissionMode(policy.MCPIntrospectionMode),
+		MCPReadMode:              normalizeToolPermissionMode(policy.MCPReadMode),
+		MCPWriteMode:             normalizeToolPermissionMode(policy.MCPWriteMode),
+		MCPSensitiveMode:         normalizeToolPermissionMode(policy.MCPSensitiveMode),
 	}
 }
 
@@ -355,6 +408,13 @@ func capabilityWorkspaceRoot(promptBuilder *PromptBuilder) string {
 		return ""
 	}
 	return strings.TrimSpace(promptBuilder.Workspace.Root)
+}
+
+func capabilitySkillsRoot(promptBuilder *PromptBuilder) string {
+	if promptBuilder == nil || promptBuilder.Skills == nil || !promptBuilder.Skills.Enabled() {
+		return ""
+	}
+	return strings.TrimSpace(promptBuilder.Skills.Root)
 }
 
 func enabledLabel(enabled bool) string {
@@ -429,6 +489,25 @@ func summarizeChannelTools(definitions []agenttools.Definition) ([]string, []str
 	}
 	slices.Sort(classes)
 	return names, classes, mutationEnabled
+}
+
+func skillModeLabel(promptPackage PromptPackage) string {
+	if len(promptPackage.Skills.AllSkills) == 0 {
+		return "disabled"
+	}
+	return "prompt_only"
+}
+
+func skillNames(items []skillPromptBlock) []string {
+	names := make([]string, 0, len(items))
+	for _, item := range items {
+		if strings.TrimSpace(item.Name) == "" {
+			continue
+		}
+		names = append(names, item.Name)
+	}
+	slices.Sort(names)
+	return names
 }
 
 func filterNonEmpty(items []string) []string {

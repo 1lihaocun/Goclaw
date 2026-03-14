@@ -8,6 +8,7 @@ import (
 
 	"goclaw/internal/domain"
 	"goclaw/internal/memory"
+	skillsctx "goclaw/internal/skills"
 	sqlitestore "goclaw/internal/store/sqlite"
 	workspacectx "goclaw/internal/workspace"
 )
@@ -37,6 +38,21 @@ type PromptPackage struct {
 	Messages     []PromptMessage
 	MemoryHits   []PromptMemoryHit
 	Retrieval    RetrievalPlan
+	Skills       skillPromptSnapshot
+}
+
+type skillPromptSnapshot struct {
+	Root         string
+	AllSkills    []skillPromptBlock
+	InlineSkills []skillPromptBlock
+}
+
+type skillPromptBlock struct {
+	Name        string
+	Description string
+	WhenToUse   string
+	Path        string
+	Content     string
 }
 
 func (p PromptPackage) RenderSystemPrompt() string {
@@ -66,6 +82,7 @@ type PromptBuilder struct {
 	Repos     sqlitestore.Repositories
 	Memory    memory.Provider
 	Workspace *workspacectx.Loader
+	Skills    *skillsctx.Loader
 }
 
 func NewPromptBuilder(
@@ -141,18 +158,24 @@ func (b *PromptBuilder) Build(ctx context.Context, input PromptBuildInput) (Prom
 	if err != nil {
 		return PromptPackage{}, err
 	}
+	skillSnapshot, err := b.collectSkillsSnapshot(ctx)
+	if err != nil {
+		return PromptPackage{}, err
+	}
 
 	return PromptPackage{
 		SystemBlocks: buildSystemBlocks(
 			input.RoomContext,
 			retrieval,
 			workspaceContext,
+			skillSnapshot,
 			memoryHits,
 			len(messages),
 		),
 		Messages:   toPromptMessages(messages),
 		MemoryHits: memoryHits,
 		Retrieval:  retrieval,
+		Skills:     skillSnapshot,
 	}, nil
 }
 
@@ -245,6 +268,17 @@ func (b *PromptBuilder) collectWorkspaceContext(
 	})
 }
 
+func (b *PromptBuilder) collectSkillsSnapshot(ctx context.Context) (skillPromptSnapshot, error) {
+	if b.Skills == nil || !b.Skills.Enabled() {
+		return skillPromptSnapshot{}, nil
+	}
+	snapshot, err := b.Skills.LoadPromptSnapshot(ctx)
+	if err != nil {
+		return skillPromptSnapshot{}, err
+	}
+	return toSkillPromptSnapshot(snapshot), nil
+}
+
 func (b *PromptBuilder) memoryEnabled() bool {
 	return b.Memory != nil && b.Memory.Name() != "noop"
 }
@@ -259,6 +293,7 @@ func buildSystemBlocks(
 	roomContext RoomContext,
 	retrieval RetrievalPlan,
 	workspaceContext workspacectx.PromptContext,
+	skillSnapshot skillPromptSnapshot,
 	memoryHits []PromptMemoryHit,
 	recentTranscriptCount int,
 ) []PromptBlock {
@@ -309,6 +344,7 @@ func buildSystemBlocks(
 	}
 
 	blocks = append(blocks, toPromptBlocks(workspaceContext.RuleBlocks)...)
+	blocks = append(blocks, buildSkillBlocks(skillSnapshot)...)
 
 	if strings.TrimSpace(roomContext.Session.SummaryText) != "" {
 		blocks = append(blocks, PromptBlock{
@@ -358,6 +394,82 @@ func toPromptBlocks(blocks []workspacectx.Block) []PromptBlock {
 		out = append(out, PromptBlock{
 			Title:   block.Title,
 			Content: block.Content,
+		})
+	}
+	return out
+}
+
+func buildSkillBlocks(snapshot skillPromptSnapshot) []PromptBlock {
+	if len(snapshot.AllSkills) == 0 {
+		return nil
+	}
+	lines := []string{
+		"Skills are prompt guidance only. They do not grant new tool visibility or permission.",
+		"When one listed skill is clearly relevant and you need detailed instructions, read the SKILL.md at the listed path before following it.",
+		fmt.Sprintf("available=%d", len(snapshot.AllSkills)),
+		fmt.Sprintf("inline=%d", len(snapshot.InlineSkills)),
+	}
+	for _, skill := range snapshot.AllSkills {
+		summary := "- " + skill.Name
+		if strings.TrimSpace(skill.Description) != "" {
+			summary += ": " + skill.Description
+		}
+		if strings.TrimSpace(skill.WhenToUse) != "" {
+			summary += " when_to_use=" + skill.WhenToUse
+		}
+		if strings.TrimSpace(skill.Path) != "" {
+			summary += " path=" + skill.Path
+		}
+		lines = append(lines, summary)
+	}
+
+	blocks := []PromptBlock{{
+		Title:   "Skills",
+		Content: strings.Join(lines, "\n"),
+	}}
+	for _, skill := range snapshot.InlineSkills {
+		meta := []string{}
+		if strings.TrimSpace(skill.Path) != "" {
+			meta = append(meta, "path="+skill.Path)
+		}
+		if strings.TrimSpace(skill.Description) != "" {
+			meta = append(meta, "description="+skill.Description)
+		}
+		if strings.TrimSpace(skill.WhenToUse) != "" {
+			meta = append(meta, "when_to_use="+skill.WhenToUse)
+		}
+		content := strings.Join(meta, "\n")
+		if strings.TrimSpace(skill.Content) != "" {
+			if content != "" {
+				content += "\n\n"
+			}
+			content += skill.Content
+		}
+		blocks = append(blocks, PromptBlock{
+			Title:   "Skill: " + skill.Name,
+			Content: content,
+		})
+	}
+	return blocks
+}
+
+func toSkillPromptSnapshot(snapshot skillsctx.Snapshot) skillPromptSnapshot {
+	return skillPromptSnapshot{
+		Root:         snapshot.Root,
+		AllSkills:    toSkillPromptBlocks(snapshot.AllSkills),
+		InlineSkills: toSkillPromptBlocks(snapshot.InlineSkills),
+	}
+}
+
+func toSkillPromptBlocks(skills []skillsctx.Skill) []skillPromptBlock {
+	out := make([]skillPromptBlock, 0, len(skills))
+	for _, skill := range skills {
+		out = append(out, skillPromptBlock{
+			Name:        skill.Name,
+			Description: skill.Description,
+			WhenToUse:   skill.WhenToUse,
+			Path:        skill.Path,
+			Content:     skill.Content,
 		})
 	}
 	return out

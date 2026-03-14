@@ -286,6 +286,20 @@ var schemaMigrations = []Migration{
 			`ALTER TABLE tool_invocations ADD COLUMN capability_id TEXT NOT NULL DEFAULT '';`,
 		},
 	},
+	{
+		Version: 9,
+		Name:    "mcp_tool_policy",
+		Statements: []string{
+			`ALTER TABLE tool_permission_policies ADD COLUMN mcp_introspection_mode TEXT NOT NULL DEFAULT 'deny_all';`,
+			`ALTER TABLE tool_permission_policies ADD COLUMN mcp_read_mode TEXT NOT NULL DEFAULT 'deny_all';`,
+			`ALTER TABLE tool_permission_policies ADD COLUMN mcp_write_mode TEXT NOT NULL DEFAULT 'deny_all';`,
+			`ALTER TABLE tool_permission_policies ADD COLUMN mcp_sensitive_mode TEXT NOT NULL DEFAULT 'deny_all';`,
+			`ALTER TABLE tool_permission_policies ADD COLUMN allowed_mcp_tools_json TEXT NOT NULL DEFAULT '[]';`,
+			`ALTER TABLE tool_permission_policies ADD COLUMN denied_mcp_tools_json TEXT NOT NULL DEFAULT '[]';`,
+			`ALTER TABLE tool_permission_policies ADD COLUMN allowed_mcp_servers_json TEXT NOT NULL DEFAULT '[]';`,
+			`ALTER TABLE tool_permission_policies ADD COLUMN denied_mcp_servers_json TEXT NOT NULL DEFAULT '[]';`,
+		},
+	},
 }
 
 func SchemaMigrations() []Migration {

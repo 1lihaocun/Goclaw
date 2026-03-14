@@ -36,6 +36,69 @@ runtime 现在只依赖 `channels.Registry`，不再直接判断 “是不是 Fe
 当前 outbound 路由也已经按 `(provider, profile_id)` 解析，而不是只按 `profile_id`。  
 这样后面同一个 profile 挂多个平台时，不会在回复链路上冲突。
 
+## Channel Runtime Surfaces
+
+截至当前代码，Feishu channel 不再只暴露“有没有账号”这一层，而是明确拆成了三种视图：
+
+1. `AccountSnapshot`
+   - 表达账号配置和路由视图。
+   - 关注点是：
+     - account 是否启用
+     - profile_id 是什么
+     - connection mode 是 `webhook` 还是 `longpoll`
+     - account 绑定到哪个 `transport_id` / `runtime_id`
+2. `TransportSnapshot`
+   - 表达 transport runtime 视图。
+   - 用来说明“当前这个平台 transport 是怎么组织的”，而不是只看账号。
+   - 当前 Feishu 的表达方式是：
+     - `webhook` account 会归并到 shared runtime：
+       - `webhook[host:port]`
+     - `longpoll` account 会各自对应 dedicated runtime：
+       - `feishu[account:longpoll]`
+3. `AccountLifecycleSpec`
+   - 表达未来 operator `start/stop/restart` 的控制面能力声明。
+   - 当前它主要回答两个问题：
+     - 这个 account 对应的是 `shared_runtime` 还是 `dedicated_runtime`
+     - 当前是否已经暴露 operator-managed lifecycle hook
+
+这三层的目标是把下面三件事彻底分开：
+
+- 账号配置是什么
+- runtime/transport 怎么跑
+- operator 能不能单独控制这个 account 的生命周期
+
+这样后面继续做 gateway operator 时，就不用再把 account config、transport inventory、lifecycle control 混在一张状态表里。
+
+## Gateway Operator Behavior
+
+截至当前代码，gateway 侧已经有最小 operator shell：
+
+- `goclaw gateway inspect --provider feishu --account-id <id>`
+- `goclaw gateway start --provider feishu --account-id <id>`
+- `goclaw gateway stop --provider feishu --account-id <id>`
+- `goclaw gateway restart --provider feishu --account-id <id>`
+
+当前 Feishu 上这几个命令的行为要分开理解：
+
+1. `inspect`
+   - 已经有实际使用价值。
+   - 它会把一个 account 的：
+     - `account`
+     - `runtime`
+     - `lifecycle`
+     - `transport`
+     - `transport_status`
+     一次性输出出来，方便 operator 看清楚这个账号到底挂在哪个 runtime 上。
+2. `start/stop/restart`
+   - 当前会返回结构化结果，但要看是不是在真实 gateway runtime 上下文里。
+   - 对 `webhook` account：
+     - 仍然通常是 `supported=false`
+   - 对 `longpoll` account：
+     - 如果只是离线 CLI 构造一个临时 `gateway.Server`，通常还是 `supported=false`
+     - 如果已经在真实 `gateway.Server` 里绑定了 runtime host，则 longpoll 已经有真正的 operator-managed lifecycle controller
+
+也就是说，当前 gateway operator 已经能“说明白为什么还不能控”，而不是只能给出一个模糊错误。
+
 ## Configuration Model
 
 GoClaw 当前配置加载顺序是：
@@ -60,6 +123,7 @@ GoClaw 当前配置加载顺序是：
       "defaultAccount": "main",
       "connectionMode": "longpoll",
       "renderMode": "auto",
+      "streamingToolSummaries": "dm_only",
       "actions": {
         "processingAck": true,
         "messageSend": true,
@@ -74,7 +138,8 @@ GoClaw 当前配置加载顺序是：
       "accounts": {
         "main": {
           "profileId": "main",
-          "renderMode": "card",
+          "renderMode": "auto",
+          "streamingToolSummaries": "all",
           "processingAckEmoji": "DONE",
           "actions": {
             "processingAck": false
@@ -138,6 +203,27 @@ GoClaw 当前配置加载顺序是：
   - `GOCLAW_CHANNELS_FEISHU_ACCOUNTS_<ID>_ACTIONS_POST_MESSAGES`
   - `GOCLAW_CHANNELS_FEISHU_ACCOUNTS_<ID>_ACTIONS_DOCS_READ`
 
+和 tool summary 可见性相关的配置项是：
+
+- top-level:
+  - `channels.feishu.streamingToolSummaries`
+- per-account override:
+  - `channels.feishu.accounts.<id>.streamingToolSummaries`
+- env:
+  - `GOCLAW_FEISHU_STREAMING_TOOL_SUMMARIES`
+  - `GOCLAW_CHANNELS_FEISHU_STREAMING_TOOL_SUMMARIES`
+- account env:
+  - `GOCLAW_CHANNELS_FEISHU_ACCOUNTS_<ID>_STREAMING_TOOL_SUMMARIES`
+
+当前支持三个值：
+
+- `off`
+  - 默认值；tool lifecycle 不对外显示
+- `dm_only`
+  - 仅 direct / p2p 会话对外显示 tool summary
+- `all`
+  - direct/group 都对外显示 tool summary
+
 处理中的 reaction emoji 仍然单独配置：
 
 - top-level: `channels.feishu.processingAckEmoji`
@@ -169,6 +255,15 @@ GoClaw 当前配置加载顺序是：
 - `interactive` -> `post`
 - `post` -> `text`
 
+当前这次 channel runtime contract 调整 **没有新增 Feishu 配置项**。  
+也就是说：
+
+- `AccountSnapshot`
+- `TransportSnapshot`
+- `AccountLifecycleSpec`
+
+目前全部都是从现有 Feishu 账号配置和 connection mode 推导出来的，不需要额外改配置文件。
+
 ## Connection Model
 
 ### Long connection mode
@@ -177,7 +272,7 @@ GoClaw 当前配置加载顺序是：
 
 - `internal/channels/feishu/channel.go`
 - `internal/channels/registry.go`
-- `internal/runtime/server.go`
+- `internal/gateway/server.go`
 - `internal/runtime/app.go`
 - `internal/feishu/longpoll/runner.go`
 - `internal/feishu/longpoll/dispatcher.go`
@@ -188,7 +283,7 @@ GoClaw 当前配置加载顺序是：
 1. `goclaw serve` 读取配置文件和环境变量
 2. `runtime.App` 构造 `channels.Registry`
 3. `channels.feishu.Channel` 按账号配置构造 longpoll runner
-4. `runtime.Server` 统一运行所有 channel transports
+4. `gateway.Server` 统一运行所有 channel transports
 5. `longpoll.Runner` 用官方 SDK 建立 Feishu WebSocket 长连接
 6. SDK 收到 Feishu IM 事件后进入 `dispatcher`
 7. `dispatcher` 把 SDK 事件转换成 GoClaw 自己的 `feishu.MessageEvent` 或 `feishu.Event`
@@ -201,19 +296,27 @@ GoClaw 当前配置加载顺序是：
 - 不使用 `GOCLAW_FEISHU_ENCRYPT_KEY`
 - 不使用 `GOCLAW_FEISHU_VERIFICATION_TOKEN`
 - 不需要本地 webhook 监听地址
+- 在 runtime surface 里，它会被表达成 dedicated runtime：
+  - `feishu[account:longpoll]`
+- 在真实 `gateway.Server` 运行上下文里，它现在已经会切到 channel-owned lifecycle controller：
+  - gateway 会先把 runtime host 绑定到 Feishu channel
+  - Feishu longpoll account 不再通过 generic `Transports(...)` 暴露
+  - 改由 channel 自己持有 per-account runtime 和 cancel/restart 逻辑
+- 但离线 CLI 仍然不是 remote control plane：
+  - 所以单独执行 `goclaw gateway start/stop/restart` 时，不等于在控制一个后台运行中的 gateway 进程
 
 ### Webhook mode
 
 Webhook 模式由这些代码组成：
 
 - `internal/channels/feishu/channel.go`
-- `internal/runtime/server.go`
+- `internal/gateway/server.go`
 - `internal/feishu/webhook.go`
 
 启动流程如下：
 
 1. `channels.feishu.Channel` 暴露 webhook routes
-2. `runtime.Server` 按监听地址聚合 routes，构造 HTTP transport
+2. `gateway.Server` 按监听地址聚合 routes，构造 HTTP transport
 3. 本地 HTTP server 监听配置的 host/port
 4. 飞书把事件 POST 到配置的 path
 5. `webhook` handler 处理 `url_verification` 和已注册的 Feishu IM 事件
@@ -221,6 +324,18 @@ Webhook 模式由这些代码组成：
 7. 业务链路继续走 `ReplyService` / `ChannelEventService`
 
 如果设置了 `EncryptKey`，Webhook 模式会验证签名并解密事件体。
+
+当前 Webhook mode 在 runtime surface 里会被表达成 shared runtime：
+
+- `webhook[host:port]`
+
+这意味着：
+
+- `goclaw gateway inspect` 已经能直接看见 shared runtime 关系
+- 多个 webhook account 如果监听同一个 `host:port`，会归到同一个 runtime 下
+- 每个 account 仍然保留自己的 webhook path binding
+- 当前不支持对单个 webhook account 做 account 级 start/stop/restart
+  - 因为它们共享同一个 process-level listener
 
 ## Shared Runtime Flow
 
@@ -358,7 +473,22 @@ Webhook 模式由这些代码组成：
 
 这里需要特别说明三点：
 
-- `message update` 当前先暴露为通用 `content json` 更新接口，CLI 额外提供了 `--text` 便捷参数
+- `message update` 当前支持更新 `text` / `post` 两类消息；CLI 提供 `--msg-type` 指定类型，并保留 `--text` 便捷参数用于文本消息
+- `message update` streaming 现在会做限频合并，并在触发 Feishu 单消息编辑次数上限时退化为补发最终消息，避免整次 reply 因编辑额度耗尽而失败
+- `renderMode=auto` 的 streaming session 现在不会在第一段不确定文本时立刻锁死后端：
+  - 首个 heading / lead-in / 模糊前缀会先缓冲
+  - 如果后续累计文本出现表格或代码块，session 仍可直接进入 CardKit streaming card
+  - 简单纯文本则会在后续累计后继续落到 message-update stream
+- runtime 的 tool-mode run 现在也不会再因为开启 tool loop 就直接跳过 delivery session：
+  - 如果当前 outbound 支持 streaming session，tool-mode run 会先进入 `RunEvent -> ReplyProjector -> projected session`
+  - tool lifecycle 的外显现在由 `streamingToolSummaries` 控制：
+    - `off` 默认隐藏
+    - `dm_only` 只在 direct / p2p 外显
+    - `all` direct/group 都外显
+  - 一旦外显，Feishu 会为每个 `toolCallId` 维护独立 tool companion message
+  - 同一 `toolCallId` 的后续 update 会优先编辑同一条 companion message
+  - 当前 companion message 优先走 `text`，否则回退 `post`
+  - 对外仍以 final text 收尾，因此 operator 侧看到的是“统一 delivery 骨架已接通，并支持按策略暴露工具摘要”，不是“工具过程默认全部外显”
 - `recall` 现在既有主动 API，也有 `im.message.recalled_v1` 的被动同步
 - `reaction` / `member` 事件已经进入事件链路，但当前还没有进一步驱动 room state 或自动回复逻辑
 - `message update` / `message recall` / `reactions` / `pins` / `processing ack` 现在都先经过 Feishu 渠道自己的 `actions` 开关，再和 room tool policy 取交集
@@ -585,8 +715,8 @@ GoClaw 本地工具权限解决的是“模型在某个 room 里能不能执行�
 - `internal/channels/types.go`
 - `internal/channels/registry.go`
 - `internal/channels/feishu/channel.go`
+- `internal/gateway/server.go`
 - `internal/runtime/app.go`
-- `internal/runtime/server.go`
 - `internal/runtime/inbound_ingestor.go`
 - `internal/runtime/channel_event_service.go`
 - `internal/runtime/reply_service.go`

@@ -15,6 +15,7 @@ import (
 
 	"goclaw/internal/config"
 	"goclaw/internal/domain"
+	"goclaw/internal/gateway"
 	"goclaw/internal/runtime"
 	sqlitestore "goclaw/internal/store/sqlite"
 	toolperm "goclaw/internal/tools"
@@ -53,13 +54,13 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	defer func() {
-		_ = app.Store.Close()
+		_ = app.Close()
 	}()
 
 	if len(args) > 0 {
 		switch args[0] {
 		case "serve":
-			if err := app.Serve(ctx); err != nil {
+			if err := gateway.NewServer(app).Serve(ctx); err != nil {
 				_, _ = fmt.Fprintf(stderr, "serve goclaw: %v\n", err)
 				return 1
 			}
@@ -94,6 +95,18 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 				return 1
 			}
 			return 0
+		case "mcp":
+			if err := runMCPCommand(ctx, app, args[1:], stdout); err != nil {
+				_, _ = fmt.Fprintf(stderr, "mcp: %v\n", err)
+				return 1
+			}
+			return 0
+		case "skills":
+			if err := runSkillsCommand(ctx, app, args[1:], stdout); err != nil {
+				_, _ = fmt.Fprintf(stderr, "skills: %v\n", err)
+				return 1
+			}
+			return 0
 		case "tooling":
 			if err := runToolingCommand(ctx, app, args[1:], stdout); err != nil {
 				_, _ = fmt.Fprintf(stderr, "tooling: %v\n", err)
@@ -103,6 +116,12 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		case "feishu":
 			if err := runFeishuCommand(ctx, app, args[1:], stdout); err != nil {
 				_, _ = fmt.Fprintf(stderr, "feishu: %v\n", err)
+				return 1
+			}
+			return 0
+		case "gateway":
+			if err := runGatewayCommand(ctx, app, args[1:], stdout); err != nil {
+				_, _ = fmt.Fprintf(stderr, "gateway: %v\n", err)
 				return 1
 			}
 			return 0
@@ -437,6 +456,10 @@ func runPermissionsSet(ctx context.Context, app *runtime.App, args []string, std
 	var channelReadMode optionalStringFlag
 	var channelWriteMode optionalStringFlag
 	var channelSensitiveMode optionalStringFlag
+	var mcpIntrospectionMode optionalStringFlag
+	var mcpReadMode optionalStringFlag
+	var mcpWriteMode optionalStringFlag
+	var mcpSensitiveMode optionalStringFlag
 	var allowCommands optionalCSVFlag
 	var denyCommands optionalCSVFlag
 	var allowPaths optionalCSVFlag
@@ -447,6 +470,10 @@ func runPermissionsSet(ctx context.Context, app *runtime.App, args []string, std
 	var denyChannelTools optionalCSVFlag
 	var allowChannelProviders optionalCSVFlag
 	var denyChannelProviders optionalCSVFlag
+	var allowMCPTools optionalCSVFlag
+	var denyMCPTools optionalCSVFlag
+	var allowMCPServers optionalCSVFlag
+	var denyMCPServers optionalCSVFlag
 
 	fs.StringVar(&profileID, "profile-id", "", "profile id")
 	fs.StringVar(&roomID, "room-id", "", "room id")
@@ -458,6 +485,10 @@ func runPermissionsSet(ctx context.Context, app *runtime.App, args []string, std
 	fs.Var(&channelReadMode, "channel-read-mode", "channel read mode: deny_all, allow_all, allow_list")
 	fs.Var(&channelWriteMode, "channel-write-mode", "channel write mode: deny_all, allow_all, allow_list")
 	fs.Var(&channelSensitiveMode, "channel-sensitive-mode", "channel sensitive mode: deny_all, allow_all, allow_list")
+	fs.Var(&mcpIntrospectionMode, "mcp-introspection-mode", "mcp introspection mode: deny_all, allow_all, allow_list")
+	fs.Var(&mcpReadMode, "mcp-read-mode", "mcp read mode: deny_all, allow_all, allow_list")
+	fs.Var(&mcpWriteMode, "mcp-write-mode", "mcp write mode: deny_all, allow_all, allow_list")
+	fs.Var(&mcpSensitiveMode, "mcp-sensitive-mode", "mcp sensitive mode: deny_all, allow_all, allow_list")
 	fs.Var(&allowCommands, "allow-commands", "comma-separated command allowlist")
 	fs.Var(&denyCommands, "deny-commands", "comma-separated command denylist")
 	fs.Var(&allowPaths, "allow-paths", "comma-separated path allowlist")
@@ -468,6 +499,10 @@ func runPermissionsSet(ctx context.Context, app *runtime.App, args []string, std
 	fs.Var(&denyChannelTools, "deny-channel-tools", "comma-separated channel tool denylist")
 	fs.Var(&allowChannelProviders, "allow-channel-providers", "comma-separated channel provider allowlist")
 	fs.Var(&denyChannelProviders, "deny-channel-providers", "comma-separated channel provider denylist")
+	fs.Var(&allowMCPTools, "allow-mcp-tools", "comma-separated mcp tool allowlist")
+	fs.Var(&denyMCPTools, "deny-mcp-tools", "comma-separated mcp tool denylist")
+	fs.Var(&allowMCPServers, "allow-mcp-servers", "comma-separated mcp server allowlist")
+	fs.Var(&denyMCPServers, "deny-mcp-servers", "comma-separated mcp server denylist")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -536,6 +571,34 @@ func runPermissionsSet(ctx context.Context, app *runtime.App, args []string, std
 		}
 		policy.ChannelSensitiveMode = parsed
 	}
+	if mcpIntrospectionMode.set {
+		parsed, err := parseToolPermissionMode(mcpIntrospectionMode.value)
+		if err != nil {
+			return err
+		}
+		policy.MCPIntrospectionMode = parsed
+	}
+	if mcpReadMode.set {
+		parsed, err := parseToolPermissionMode(mcpReadMode.value)
+		if err != nil {
+			return err
+		}
+		policy.MCPReadMode = parsed
+	}
+	if mcpWriteMode.set {
+		parsed, err := parseToolPermissionMode(mcpWriteMode.value)
+		if err != nil {
+			return err
+		}
+		policy.MCPWriteMode = parsed
+	}
+	if mcpSensitiveMode.set {
+		parsed, err := parseToolPermissionMode(mcpSensitiveMode.value)
+		if err != nil {
+			return err
+		}
+		policy.MCPSensitiveMode = parsed
+	}
 	if allowCommands.set {
 		policy.AllowedCommands = allowCommands.values
 	}
@@ -565,6 +628,18 @@ func runPermissionsSet(ctx context.Context, app *runtime.App, args []string, std
 	}
 	if denyChannelProviders.set {
 		policy.DeniedChannelProviders = denyChannelProviders.values
+	}
+	if allowMCPTools.set {
+		policy.AllowedMCPTools = allowMCPTools.values
+	}
+	if denyMCPTools.set {
+		policy.DeniedMCPTools = denyMCPTools.values
+	}
+	if allowMCPServers.set {
+		policy.AllowedMCPServers = allowMCPServers.values
+	}
+	if denyMCPServers.set {
+		policy.DeniedMCPServers = denyMCPServers.values
 	}
 
 	if err := app.Repos.ToolPermissions.Upsert(ctx, policy); err != nil {
@@ -782,6 +857,10 @@ func writeToolPermissionPolicy(stdout io.Writer, policy domain.ToolPermissionPol
 		ChannelReadMode          string   `json:"channel_read_mode"`
 		ChannelWriteMode         string   `json:"channel_write_mode"`
 		ChannelSensitiveMode     string   `json:"channel_sensitive_mode"`
+		MCPIntrospectionMode     string   `json:"mcp_introspection_mode"`
+		MCPReadMode              string   `json:"mcp_read_mode"`
+		MCPWriteMode             string   `json:"mcp_write_mode"`
+		MCPSensitiveMode         string   `json:"mcp_sensitive_mode"`
 		AllowedCommands          []string `json:"allowed_commands,omitempty"`
 		DeniedCommands           []string `json:"denied_commands,omitempty"`
 		AllowedPaths             []string `json:"allowed_paths,omitempty"`
@@ -792,6 +871,10 @@ func writeToolPermissionPolicy(stdout io.Writer, policy domain.ToolPermissionPol
 		DeniedChannelTools       []string `json:"denied_channel_tools,omitempty"`
 		AllowedChannelProviders  []string `json:"allowed_channel_providers,omitempty"`
 		DeniedChannelProviders   []string `json:"denied_channel_providers,omitempty"`
+		AllowedMCPTools          []string `json:"allowed_mcp_tools,omitempty"`
+		DeniedMCPTools           []string `json:"denied_mcp_tools,omitempty"`
+		AllowedMCPServers        []string `json:"allowed_mcp_servers,omitempty"`
+		DeniedMCPServers         []string `json:"denied_mcp_servers,omitempty"`
 		Explicit                 bool     `json:"explicit"`
 		UpdatedBy                string   `json:"updated_by,omitempty"`
 		CreatedAt                string   `json:"created_at,omitempty"`
@@ -808,6 +891,10 @@ func writeToolPermissionPolicy(stdout io.Writer, policy domain.ToolPermissionPol
 		ChannelReadMode:          string(policy.ChannelReadMode),
 		ChannelWriteMode:         string(policy.ChannelWriteMode),
 		ChannelSensitiveMode:     string(policy.ChannelSensitiveMode),
+		MCPIntrospectionMode:     string(policy.MCPIntrospectionMode),
+		MCPReadMode:              string(policy.MCPReadMode),
+		MCPWriteMode:             string(policy.MCPWriteMode),
+		MCPSensitiveMode:         string(policy.MCPSensitiveMode),
 		AllowedCommands:          append([]string(nil), policy.AllowedCommands...),
 		DeniedCommands:           append([]string(nil), policy.DeniedCommands...),
 		AllowedPaths:             append([]string(nil), policy.AllowedPaths...),
@@ -818,6 +905,10 @@ func writeToolPermissionPolicy(stdout io.Writer, policy domain.ToolPermissionPol
 		DeniedChannelTools:       append([]string(nil), policy.DeniedChannelTools...),
 		AllowedChannelProviders:  append([]string(nil), policy.AllowedChannelProviders...),
 		DeniedChannelProviders:   append([]string(nil), policy.DeniedChannelProviders...),
+		AllowedMCPTools:          append([]string(nil), policy.AllowedMCPTools...),
+		DeniedMCPTools:           append([]string(nil), policy.DeniedMCPTools...),
+		AllowedMCPServers:        append([]string(nil), policy.AllowedMCPServers...),
+		DeniedMCPServers:         append([]string(nil), policy.DeniedMCPServers...),
 		Explicit:                 policy.Explicit,
 		UpdatedBy:                policy.UpdatedBy,
 	}

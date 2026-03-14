@@ -40,17 +40,19 @@ type outboundResolver interface {
 }
 
 type ReplyService struct {
-	ChatService               *ChatService
-	PromptBuilder             *PromptBuilder
-	Model                     model.Provider
-	Outbounds                 outboundResolver
-	Tools                     *toolruntime.LocalRuntime
-	AgentTools                *agenttools.Registry
-	LegacyToolFallbackEnabled bool
-	ToolMaxIterations         int
-	Repos                     sqlitestore.Repositories
-	Now                       func() time.Time
-	Logger                    *slog.Logger
+	ChatService                  *ChatService
+	PromptBuilder                *PromptBuilder
+	Model                        model.Provider
+	Outbounds                    outboundResolver
+	Tools                        *toolruntime.LocalRuntime
+	AgentTools                   *agenttools.Registry
+	RunObservers                 []RunObserver
+	FeishuStreamingToolSummaries string
+	LegacyToolFallbackEnabled    bool
+	ToolMaxIterations            int
+	Repos                        sqlitestore.Repositories
+	Now                          func() time.Time
+	Logger                       *slog.Logger
 }
 
 func NewReplyService(
@@ -60,16 +62,17 @@ func NewReplyService(
 	outbounds outboundResolver,
 ) *ReplyService {
 	return &ReplyService{
-		ChatService:               NewChatService(repos),
-		PromptBuilder:             promptBuilder,
-		Model:                     modelProvider,
-		Outbounds:                 outbounds,
-		Tools:                     toolruntime.NewLocalRuntime(repos.ToolPermissions, nil),
-		LegacyToolFallbackEnabled: false,
-		ToolMaxIterations:         config.Default().Tooling.MaxIterations,
-		Repos:                     repos,
-		Now:                       time.Now,
-		Logger:                    slog.Default(),
+		ChatService:                  NewChatService(repos),
+		PromptBuilder:                promptBuilder,
+		Model:                        modelProvider,
+		Outbounds:                    outbounds,
+		Tools:                        toolruntime.NewLocalRuntime(repos.ToolPermissions, nil),
+		FeishuStreamingToolSummaries: config.Default().Channels.Feishu.StreamingToolSummaries,
+		LegacyToolFallbackEnabled:    false,
+		ToolMaxIterations:            config.Default().Tooling.MaxIterations,
+		Repos:                        repos,
+		Now:                          time.Now,
+		Logger:                       slog.Default(),
 	}
 }
 
@@ -113,43 +116,60 @@ func (s *ReplyService) IngestInboundMessage(
 	if err != nil {
 		return err
 	}
-
-	replyText, err := s.generateReplyText(ctx, roomContext, promptPackage)
+	runSnapshot, err := s.buildRunSnapshot(ctx, roomContext, promptPackage)
 	if err != nil {
 		return err
 	}
-	replyText = strings.TrimSpace(replyText)
-	if replyText == "" {
-		return nil
-	}
 
-	sendResult, err := s.sendChannelReply(ctx, outbound, roomContext, replyText)
-	if err != nil {
+	replyText, sendResult, streamed, err := s.streamChannelReply(ctx, outbound, runSnapshot)
+	if !streamed {
+		replyText, sendResult, streamed, err = s.projectChannelReply(ctx, outbound, runSnapshot)
+	}
+	if !streamed {
+		replyText, err = s.generateReplyTextFromSnapshot(ctx, runSnapshot)
+		if err != nil {
+			return err
+		}
+		replyText = strings.TrimSpace(replyText)
+		if replyText == "" {
+			return nil
+		}
+
+		sendResult, err = s.sendChannelReply(ctx, outbound, runSnapshot, replyText)
+		if err != nil {
+			return err
+		}
+	} else if err != nil {
 		return err
+	} else {
+		replyText = strings.TrimSpace(replyText)
+		if replyText == "" {
+			return nil
+		}
 	}
 	s.Logger.Info(
 		"runtime: sent channel reply",
-		"profile_id", roomContext.Profile.ID,
+		"profile_id", runSnapshot.Profile.ID,
 		"provider", outbound.Provider(),
-		"room_id", roomContext.Room.ID,
+		"room_id", runSnapshot.Room.ID,
 		"request_message_id", message.ProviderMessageID,
 		"reply_message_id", sendResult.MessageID,
 		"model_provider", s.Model.Name(),
 	)
 
-	assistantPerson, err := s.ensureAssistantPerson(ctx, roomContext.Profile.ID, roomContext.Room.Provider)
+	assistantPerson, err := s.ensureAssistantPerson(ctx, runSnapshot.Profile.ID, runSnapshot.Room.Provider)
 	if err != nil {
 		return err
 	}
 
 	replyCreatedAt := s.Now().UTC().Add(time.Nanosecond)
 	assistantMessage := domain.Message{
-		ID:                buildAssistantMessageID(roomContext.Profile.ID, roomContext.Room.Provider, sendResult.MessageID, s.Now),
-		ProfileID:         roomContext.Profile.ID,
-		RoomID:            roomContext.Room.ID,
-		ConversationID:    roomContext.Conversation.ID,
+		ID:                buildAssistantMessageID(runSnapshot.Profile.ID, runSnapshot.Room.Provider, sendResult.MessageID, s.Now),
+		ProfileID:         runSnapshot.Profile.ID,
+		RoomID:            runSnapshot.Room.ID,
+		ConversationID:    runSnapshot.Conversation.ID,
 		PersonID:          assistantPerson.ID,
-		SessionID:         roomContext.Session.ID,
+		SessionID:         runSnapshot.Session.ID,
 		ProviderMessageID: sendResult.MessageID,
 		Role:              domain.MessageRoleAssistant,
 		ContentText:       replyText,
@@ -161,7 +181,7 @@ func (s *ReplyService) IngestInboundMessage(
 		return err
 	}
 
-	if _, err := s.ChatService.RefreshRoomSessionSummary(ctx, roomContext.Profile.ID, roomContext.Room.ID); err != nil {
+	if _, err := s.ChatService.RefreshRoomSessionSummary(ctx, runSnapshot.Profile.ID, runSnapshot.Room.ID); err != nil {
 		return err
 	}
 
@@ -170,8 +190,8 @@ func (s *ReplyService) IngestInboundMessage(
 		s.Repos,
 		s.PromptBuilder.Workspace,
 		s.Now,
-		roomContext,
-		promptPackage,
+		runSnapshot.RoomContext(),
+		runSnapshot.Prompt,
 		assistantMessage,
 	)
 	return nil
@@ -180,14 +200,14 @@ func (s *ReplyService) IngestInboundMessage(
 func (s *ReplyService) sendChannelReply(
 	ctx context.Context,
 	outbound channelcore.Outbound,
-	roomContext RoomContext,
+	snapshot RunSnapshot,
 	replyText string,
 ) (channelcore.SendResult, error) {
-	replyToMessageID := strings.TrimSpace(roomContext.TriggerProviderMessageID)
+	replyToMessageID := strings.TrimSpace(snapshot.TriggerProviderMessageID)
 	if replyingOutbound, ok := outbound.(replyTextOutbound); ok && replyToMessageID != "" {
-		return replyingOutbound.SendReplyText(ctx, string(roomContext.Room.ID), replyToMessageID, replyText)
+		return replyingOutbound.SendReplyText(ctx, string(snapshot.Room.ID), replyToMessageID, replyText)
 	}
-	return outbound.SendText(ctx, string(roomContext.Room.ID), replyText)
+	return outbound.SendText(ctx, string(snapshot.Room.ID), replyText)
 }
 
 func (s *ReplyService) beginProcessingAck(

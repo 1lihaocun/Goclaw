@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	channelcore "goclaw/internal/channels"
 	"goclaw/internal/config"
@@ -25,21 +26,22 @@ var (
 )
 
 type accountSettings struct {
-	Name               string
-	RenderMode         string
-	Actions            config.FeishuActionsConfig
-	ProcessingAckEmoji string
-	ProfileID          domain.ProfileID
-	ConnectionMode     string
-	WebhookHost        string
-	WebhookPort        int
-	WebhookPath        string
-	APIBaseURL         string
-	AppID              string
-	AppSecret          string
-	EncryptKey         string
-	VerificationToken  string
-	MaxBodyBytes       int64
+	Name                   string
+	RenderMode             string
+	StreamingToolSummaries string
+	Actions                config.FeishuActionsConfig
+	ProcessingAckEmoji     string
+	ProfileID              domain.ProfileID
+	ConnectionMode         string
+	WebhookHost            string
+	WebhookPort            int
+	WebhookPath            string
+	APIBaseURL             string
+	AppID                  string
+	AppSecret              string
+	EncryptKey             string
+	VerificationToken      string
+	MaxBodyBytes           int64
 }
 
 type resolvedAccount struct {
@@ -50,11 +52,20 @@ type resolvedAccount struct {
 	TransportID string
 }
 
+type longpollRunner interface {
+	Run(ctx context.Context) error
+}
+
 type Channel struct {
 	config    config.FeishuConfig
 	accounts  []resolvedAccount
 	outbounds []channelcore.Outbound
 	logger    *slog.Logger
+
+	runtimeMu         sync.Mutex
+	runtimeBinding    *runtimeBinding
+	longpollRuntimes  map[string]*managedLongpollRuntime
+	newLongpollRunner func(params rawlongpoll.Params) (longpollRunner, error)
 }
 
 func New(cfg config.FeishuConfig, logger *slog.Logger) *Channel {
@@ -72,10 +83,14 @@ func New(cfg config.FeishuConfig, logger *slog.Logger) *Channel {
 	}
 
 	return &Channel{
-		config:    cfg,
-		accounts:  accounts,
-		outbounds: outbounds,
-		logger:    logger,
+		config:           cfg,
+		accounts:         accounts,
+		outbounds:        outbounds,
+		logger:           logger,
+		longpollRuntimes: make(map[string]*managedLongpollRuntime),
+		newLongpollRunner: func(params rawlongpoll.Params) (longpollRunner, error) {
+			return rawlongpoll.New(params)
+		},
 	}
 }
 
@@ -120,16 +135,11 @@ func (c *Channel) Transports(params channelcore.BuildRuntimeParams) ([]channelco
 		if !account.Enabled || !isLongpollMode(account.Settings.ConnectionMode) {
 			continue
 		}
+		if c.longpollLifecycleAvailable() {
+			continue
+		}
 
-		runner, err := rawlongpoll.New(rawlongpoll.Params{
-			ProfileID:     account.Settings.ProfileID,
-			AppID:         account.Settings.AppID,
-			AppSecret:     account.Settings.AppSecret,
-			BaseURL:       account.Settings.APIBaseURL,
-			Ingestor:      newMessageEventIngestor(account.Settings.ProfileID, params.Ingestor),
-			EventObserver: newEventObserver(account.Settings.ProfileID, params.EventObserver),
-			Logger:        params.Logger,
-		})
+		runner, err := c.buildLongpollRunner(account, params)
 		if err != nil {
 			return nil, err
 		}
@@ -141,6 +151,24 @@ func (c *Channel) Transports(params channelcore.BuildRuntimeParams) ([]channelco
 		})
 	}
 	return transports, nil
+}
+
+func (c *Channel) buildLongpollRunner(
+	account resolvedAccount,
+	params channelcore.BuildRuntimeParams,
+) (longpollRunner, error) {
+	if c == nil || c.newLongpollRunner == nil {
+		return nil, fmt.Errorf("feishu channel: longpoll runner factory is unavailable")
+	}
+	return c.newLongpollRunner(rawlongpoll.Params{
+		ProfileID:     account.Settings.ProfileID,
+		AppID:         account.Settings.AppID,
+		AppSecret:     account.Settings.AppSecret,
+		BaseURL:       account.Settings.APIBaseURL,
+		Ingestor:      newMessageEventIngestor(account.Settings.ProfileID, params.Ingestor),
+		EventObserver: newEventObserver(account.Settings.ProfileID, params.EventObserver),
+		Logger:        params.Logger,
+	})
 }
 
 type outbound struct {
@@ -188,6 +216,22 @@ func (o *outbound) SendReplyText(
 		return channelcore.SendResult{}, err
 	}
 	return toChannelSendResult(result), nil
+}
+
+func (o *outbound) BeginStreamingReply(
+	ctx context.Context,
+	target channelcore.StreamingReplyTarget,
+) (channelcore.StreamingReplySession, error) {
+	if !o.streamingEnabled() {
+		return nil, fmt.Errorf("feishu channel: streaming replies are unavailable")
+	}
+	return &feishuStreamingReplySession{
+		outbound: o,
+		target: channelcore.StreamingReplyTarget{
+			RoomID:           strings.TrimSpace(target.RoomID),
+			ReplyToMessageID: strings.TrimSpace(target.ReplyToMessageID),
+		},
+	}, nil
 }
 
 func (o *outbound) sendMarkdownText(
@@ -261,6 +305,10 @@ func (o *outbound) preferCard(text string) bool {
 	}
 }
 
+func (o *outbound) streamingEnabled() bool {
+	return o.account.Settings.Actions.MessageSend || o.account.Settings.Actions.PostMessages
+}
+
 func shouldUseFeishuMarkdownCard(text string) bool {
 	return feishuFencedCodeBlockPattern.MatchString(text) || feishuMarkdownTablePattern.MatchString(text)
 }
@@ -270,6 +318,345 @@ func toChannelSendResult(result rawfeishu.SendResult) channelcore.SendResult {
 		MessageID: result.MessageID,
 		RoomID:    result.ChatID,
 	}
+}
+
+type feishuStreamingReplySession struct {
+	outbound *outbound
+	target   channelcore.StreamingReplyTarget
+
+	mu             sync.Mutex
+	session        feishuStreamingSession
+	bufferedText   string
+	bufferedUpdate int
+	toolMessages   map[string]*toolCompanionMessage
+}
+
+type toolCompanionMessage struct {
+	session feishuStreamingSession
+	text    string
+}
+
+func (s *feishuStreamingReplySession) SendResult() channelcore.SendResult {
+	session := s.currentSession()
+	if session == nil {
+		return channelcore.SendResult{}
+	}
+	return toChannelSendResult(session.SendResult())
+}
+
+func (s *feishuStreamingReplySession) UpdateText(ctx context.Context, text string) error {
+	session, deliverText, err := s.ensureSession(ctx, text, false)
+	if err != nil || session == nil || deliverText == "" {
+		return err
+	}
+	return session.Update(ctx, deliverText)
+}
+
+func (s *feishuStreamingReplySession) Close(ctx context.Context, finalText string) error {
+	session, deliverText, err := s.ensureSession(ctx, finalText, true)
+	if err != nil {
+		return err
+	}
+	if session != nil {
+		if err := session.Close(ctx, deliverText); err != nil {
+			return err
+		}
+	}
+	return s.closeToolMessages(ctx)
+}
+
+type feishuStreamingSession interface {
+	SendResult() rawfeishu.SendResult
+	Update(context.Context, string) error
+	Close(context.Context, string) error
+}
+
+func (s *feishuStreamingReplySession) currentSession() feishuStreamingSession {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.session
+}
+
+func (s *feishuStreamingReplySession) ensureSession(
+	ctx context.Context,
+	text string,
+	closing bool,
+) (feishuStreamingSession, string, error) {
+	if s == nil || s.outbound == nil || s.outbound.messenger == nil {
+		return nil, "", nil
+	}
+	text = strings.TrimSpace(text)
+	s.mu.Lock()
+	if text != "" {
+		s.bufferedText = text
+	}
+	if s.session != nil {
+		session := s.session
+		deliverText := s.bufferedText
+		s.mu.Unlock()
+		return session, deliverText, nil
+	}
+	if text != "" && !closing {
+		s.bufferedUpdate++
+	}
+	deliverText := s.bufferedText
+	if !s.shouldStartSessionLocked(deliverText, closing) {
+		s.mu.Unlock()
+		return nil, "", nil
+	}
+	s.mu.Unlock()
+
+	session, err := s.startSession(ctx, deliverText)
+	if err != nil {
+		return nil, "", err
+	}
+
+	s.mu.Lock()
+	if s.session == nil {
+		s.session = session
+	}
+	current := s.session
+	deliverText = s.bufferedText
+	s.mu.Unlock()
+	return current, deliverText, nil
+}
+
+func (s *feishuStreamingReplySession) shouldStartSessionLocked(
+	text string,
+	closing bool,
+) bool {
+	if strings.TrimSpace(text) == "" {
+		return false
+	}
+	if closing {
+		return true
+	}
+	if s == nil || s.outbound == nil {
+		return true
+	}
+	if normalizeRenderMode(s.outbound.account.Settings.RenderMode) != "auto" {
+		return true
+	}
+	if s.shouldUseStreamingCard(text) {
+		return true
+	}
+	return !shouldDelayFeishuAutoStreamingStart(text, s.bufferedUpdate)
+}
+
+func (s *feishuStreamingReplySession) startSession(
+	ctx context.Context,
+	text string,
+) (feishuStreamingSession, error) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil, nil
+	}
+	if s.shouldUseStreamingCard(text) {
+		session, err := s.outbound.messenger.BeginStreamingCard(ctx, rawfeishu.StreamingCardRequest{
+			ChatID:           s.target.RoomID,
+			ReplyToMessageID: s.target.ReplyToMessageID,
+			InitialText:      text,
+		})
+		if err == nil {
+			return session, nil
+		}
+		if msgType, ok := s.streamingMessageType(); ok {
+			fallback, fallbackErr := s.outbound.messenger.BeginStreamingMessageUpdate(ctx, rawfeishu.StreamingMessageRequest{
+				ChatID:           s.target.RoomID,
+				ReplyToMessageID: s.target.ReplyToMessageID,
+				InitialText:      text,
+				MsgType:          msgType,
+			})
+			if fallbackErr == nil {
+				return fallback, nil
+			}
+		}
+		return nil, err
+	}
+
+	msgType, ok := s.streamingMessageType()
+	if ok {
+		return s.outbound.messenger.BeginStreamingMessageUpdate(ctx, rawfeishu.StreamingMessageRequest{
+			ChatID:           s.target.RoomID,
+			ReplyToMessageID: s.target.ReplyToMessageID,
+			InitialText:      text,
+			MsgType:          msgType,
+		})
+	}
+	return s.outbound.messenger.BeginStreamingCard(ctx, rawfeishu.StreamingCardRequest{
+		ChatID:           s.target.RoomID,
+		ReplyToMessageID: s.target.ReplyToMessageID,
+		InitialText:      text,
+	})
+}
+
+func (s *feishuStreamingReplySession) shouldUseStreamingCard(text string) bool {
+	if s == nil || s.outbound == nil {
+		return false
+	}
+	switch normalizeRenderMode(s.outbound.account.Settings.RenderMode) {
+	case "card":
+		return s.outbound.account.Settings.Actions.MessageSend
+	case "raw":
+		return false
+	default:
+		return s.outbound.account.Settings.Actions.MessageSend && shouldUseFeishuMarkdownCard(text)
+	}
+}
+
+func (s *feishuStreamingReplySession) streamingMessageType() (string, bool) {
+	if s == nil || s.outbound == nil {
+		return "", false
+	}
+	if s.outbound.account.Settings.Actions.PostMessages {
+		return "post", true
+	}
+	if s.outbound.account.Settings.Actions.MessageSend {
+		return "text", true
+	}
+	return "", false
+}
+
+func (s *feishuStreamingReplySession) UpdateToolMessage(
+	ctx context.Context,
+	toolCallID, text string,
+	allowEdit bool,
+) error {
+	if s == nil || s.outbound == nil || s.outbound.messenger == nil {
+		return nil
+	}
+	toolCallID = strings.TrimSpace(toolCallID)
+	text = strings.TrimSpace(text)
+	if toolCallID == "" || text == "" || !s.toolMessagesEnabled() {
+		return nil
+	}
+
+	s.mu.Lock()
+	if s.toolMessages == nil {
+		s.toolMessages = make(map[string]*toolCompanionMessage)
+	}
+	companion := s.toolMessages[toolCallID]
+	s.mu.Unlock()
+
+	if companion == nil {
+		created, err := s.startToolMessage(ctx, text)
+		if err != nil {
+			return err
+		}
+		s.mu.Lock()
+		if s.toolMessages[toolCallID] == nil {
+			s.toolMessages[toolCallID] = created
+		}
+		companion = s.toolMessages[toolCallID]
+		s.mu.Unlock()
+	}
+	if companion == nil || companion.session == nil {
+		return nil
+	}
+	if !allowEdit {
+		s.mu.Lock()
+		companion.text = text
+		s.mu.Unlock()
+		return nil
+	}
+	if err := companion.session.Update(ctx, text); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	companion.text = text
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *feishuStreamingReplySession) toolMessagesEnabled() bool {
+	if s == nil || s.outbound == nil {
+		return false
+	}
+	return s.outbound.account.Settings.Actions.MessageUpdate &&
+		(s.outbound.account.Settings.Actions.MessageSend || s.outbound.account.Settings.Actions.PostMessages)
+}
+
+func (s *feishuStreamingReplySession) startToolMessage(
+	ctx context.Context,
+	text string,
+) (*toolCompanionMessage, error) {
+	session, err := s.outbound.messenger.BeginStreamingMessageUpdate(ctx, rawfeishu.StreamingMessageRequest{
+		ChatID:      s.target.RoomID,
+		InitialText: text,
+		MsgType:     s.toolMessageType(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &toolCompanionMessage{
+		session: session,
+		text:    text,
+	}, nil
+}
+
+func (s *feishuStreamingReplySession) toolMessageType() string {
+	if s != nil && s.outbound != nil && s.outbound.account.Settings.Actions.MessageSend {
+		return "text"
+	}
+	return "post"
+}
+
+func (s *feishuStreamingReplySession) closeToolMessages(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	messages := make([]*toolCompanionMessage, 0, len(s.toolMessages))
+	for _, message := range s.toolMessages {
+		if message != nil && message.session != nil {
+			messages = append(messages, message)
+		}
+	}
+	s.mu.Unlock()
+
+	for _, message := range messages {
+		if err := message.session.Close(ctx, message.text); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func shouldDelayFeishuAutoStreamingStart(text string, updates int) bool {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return true
+	}
+	if updates < 2 {
+		return true
+	}
+	if hasFeishuPendingMarkdownLead(text) && updates < 4 {
+		return true
+	}
+	return false
+}
+
+func hasFeishuPendingMarkdownLead(text string) bool {
+	if text == "" {
+		return false
+	}
+	if strings.Count(text, "```")%2 != 0 {
+		return true
+	}
+	if strings.Contains(text, "\n\n") {
+		return true
+	}
+	firstLine := strings.TrimSpace(strings.SplitN(text, "\n", 2)[0])
+	if firstLine == "" {
+		return false
+	}
+	return strings.HasPrefix(firstLine, "#") ||
+		strings.HasPrefix(firstLine, ">") ||
+		strings.HasPrefix(firstLine, "- ") ||
+		strings.HasPrefix(firstLine, "* ")
 }
 
 func (o *outbound) BeginProcessingAck(
@@ -489,20 +876,21 @@ func resolveAccount(cfg config.FeishuConfig, accountID string) resolvedAccount {
 	}
 
 	settings := accountSettings{
-		RenderMode:         normalizeRenderMode(cfg.RenderMode),
-		Actions:            cfg.Actions,
-		ProcessingAckEmoji: strings.TrimSpace(cfg.ProcessingAckEmoji),
-		ProfileID:          domain.ProfileID(strings.TrimSpace(cfg.ProfileID)),
-		ConnectionMode:     normalizeConnectionMode(cfg.ConnectionMode),
-		WebhookHost:        strings.TrimSpace(cfg.WebhookHost),
-		WebhookPort:        cfg.WebhookPort,
-		WebhookPath:        strings.TrimSpace(cfg.WebhookPath),
-		APIBaseURL:         strings.TrimSpace(cfg.APIBaseURL),
-		AppID:              strings.TrimSpace(cfg.AppID),
-		AppSecret:          strings.TrimSpace(cfg.AppSecret),
-		EncryptKey:         strings.TrimSpace(cfg.EncryptKey),
-		VerificationToken:  strings.TrimSpace(cfg.VerificationToken),
-		MaxBodyBytes:       cfg.MaxBodyBytes,
+		RenderMode:             normalizeRenderMode(cfg.RenderMode),
+		StreamingToolSummaries: normalizeStreamingToolSummaries(cfg.StreamingToolSummaries),
+		Actions:                cfg.Actions,
+		ProcessingAckEmoji:     strings.TrimSpace(cfg.ProcessingAckEmoji),
+		ProfileID:              domain.ProfileID(strings.TrimSpace(cfg.ProfileID)),
+		ConnectionMode:         normalizeConnectionMode(cfg.ConnectionMode),
+		WebhookHost:            strings.TrimSpace(cfg.WebhookHost),
+		WebhookPort:            cfg.WebhookPort,
+		WebhookPath:            strings.TrimSpace(cfg.WebhookPath),
+		APIBaseURL:             strings.TrimSpace(cfg.APIBaseURL),
+		AppID:                  strings.TrimSpace(cfg.AppID),
+		AppSecret:              strings.TrimSpace(cfg.AppSecret),
+		EncryptKey:             strings.TrimSpace(cfg.EncryptKey),
+		VerificationToken:      strings.TrimSpace(cfg.VerificationToken),
+		MaxBodyBytes:           cfg.MaxBodyBytes,
 	}
 	enabled := cfg.Enabled
 
@@ -515,6 +903,9 @@ func resolveAccount(cfg config.FeishuConfig, accountID string) resolvedAccount {
 		}
 		if override.RenderMode != "" {
 			settings.RenderMode = normalizeRenderMode(override.RenderMode)
+		}
+		if override.StreamingToolSummaries != "" {
+			settings.StreamingToolSummaries = normalizeStreamingToolSummaries(override.StreamingToolSummaries)
 		}
 		if override.Actions.ProcessingAck != nil {
 			settings.Actions.ProcessingAck = *override.Actions.ProcessingAck
@@ -635,6 +1026,17 @@ func normalizeRenderMode(value string) string {
 		return "raw"
 	default:
 		return "auto"
+	}
+}
+
+func normalizeStreamingToolSummaries(value string) string {
+	switch strings.TrimSpace(strings.ToLower(value)) {
+	case "all":
+		return "all"
+	case "dm_only":
+		return "dm_only"
+	default:
+		return "off"
 	}
 }
 
